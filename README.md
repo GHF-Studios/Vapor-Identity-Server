@@ -2,6 +2,8 @@
 
 Identity and role authority service for Vapor.
 
+Initial implementation uses Axum/Tokio.
+
 ## Responsibility
 
 - Steam identity;

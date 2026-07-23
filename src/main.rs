@@ -1,180 +1,127 @@
+use axum::extract::State;
+use axum::http::header::AUTHORIZATION;
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::IntoResponse;
+use axum::routing::{get, post};
+use axum::Router;
 use std::env;
-use std::fs;
-use std::io::{self, Read, Write};
-use std::net::{TcpListener, TcpStream};
-use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::fs;
+use tokio::net::TcpListener;
 
 const DEFAULT_BIND: &str = "127.0.0.1:7113";
 const DEFAULT_STATE_DIR: &str = "state/identity";
 
-#[derive(Debug)]
-struct Request {
-    method: String,
-    path: String,
-    headers: Vec<(String, String)>,
+#[derive(Clone)]
+struct AppState {
+    state_dir: Arc<PathBuf>,
+    admin_token: Option<String>,
 }
 
-fn main() -> io::Result<()> {
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bind = env::var("VAPOR_IDENTITY_BIND").unwrap_or_else(|_| DEFAULT_BIND.to_string());
     let state_dir = PathBuf::from(
-        env::var("VAPOR_IDENTITY_STATE").unwrap_or_else(|_| DEFAULT_STATE_DIR.to_string()),
+        env::var("VAPOR_IDENTITY_STATE").unwrap_or_else(|_| DEFAULT_STATE_DIR.into()),
     );
-    fs::create_dir_all(&state_dir)?;
+    fs::create_dir_all(&state_dir).await?;
 
-    let listener = TcpListener::bind(&bind)?;
+    let state = AppState {
+        state_dir: Arc::new(state_dir),
+        admin_token: env::var("VAPOR_IDENTITY_ADMIN_TOKEN")
+            .ok()
+            .filter(|value| !value.is_empty()),
+    };
+    let app = Router::new()
+        .route("/healthz", get(healthz))
+        .route("/v1/status", get(status))
+        .route("/v1/init", post(init))
+        .route("/v1/export", get(export_identity))
+        .with_state(state);
+
+    let listener = TcpListener::bind(&bind).await?;
     eprintln!("vapor-identity-server listening on {bind}");
-
-    for stream in listener.incoming() {
-        match stream {
-            Ok(mut stream) => {
-                if let Err(error) = handle_connection(&mut stream, &state_dir) {
-                    eprintln!("request failed: {error}");
-                }
-            }
-            Err(error) => eprintln!("connection failed: {error}"),
-        }
-    }
+    axum::serve(listener, app).await?;
 
     Ok(())
 }
 
-fn handle_connection(stream: &mut TcpStream, state_dir: &Path) -> io::Result<()> {
-    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
-    let Some(request) = read_request(stream)? else {
-        return Ok(());
-    };
-
-    match (request.method.as_str(), request.path.as_str()) {
-        ("GET", "/healthz") => respond_text(stream, "200 OK", "ok\n"),
-        ("GET", "/v1/status") => status(stream, state_dir),
-        ("POST", "/v1/init") => init(stream, state_dir, &request),
-        ("GET", "/v1/export") => export_identity(stream, state_dir, &request),
-        _ => respond_text(stream, "404 Not Found", "not found\n"),
-    }
+async fn healthz() -> &'static str {
+    "ok\n"
 }
 
-fn status(stream: &mut TcpStream, state_dir: &Path) -> io::Result<()> {
-    let registry = state_dir.join("registry.toml");
+async fn status(State(state): State<AppState>) -> impl IntoResponse {
+    let registry = state.state_dir.join("registry.toml");
     let initialized = registry.exists();
     let body = format!(
-        "service = \"vapor-identity-server\"\ninitialized = {}\nsteam_identity = \"planned\"\ngithub_identity = \"planned\"\n",
-        toml_bool(initialized)
+        "service = \"vapor-identity-server\"\ninitialized = {initialized}\nsteam_identity = \"planned\"\ngithub_identity = \"planned\"\n"
     );
-    respond_text(stream, "200 OK", &body)
+    (StatusCode::OK, body)
 }
 
-fn init(stream: &mut TcpStream, state_dir: &Path, request: &Request) -> io::Result<()> {
-    if !has_admin_token(request, "VAPOR_IDENTITY_ADMIN_TOKEN") {
-        return respond_text(
-            stream,
-            "401 Unauthorized",
-            "missing or invalid admin token\n",
+async fn init(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+    if !authorized(&headers, &state.admin_token) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            "missing or invalid admin token\n".to_string(),
         );
     }
 
-    let registry = state_dir.join("registry.toml");
+    let registry = state.state_dir.join("registry.toml");
     if registry.exists() {
-        return respond_text(
-            stream,
-            "409 Conflict",
-            "identity registry already initialized\n",
+        return (
+            StatusCode::CONFLICT,
+            "identity registry already initialized\n".to_string(),
         );
     }
 
-    fs::create_dir_all(state_dir)?;
-    fs::write(
-        &registry,
-        format!(
-            "schema_version = 1\ninitialized_at_unix = {}\n\n[policy]\nplayers_require_github = false\ndevelopers_require_steam = true\ndevelopers_require_github = true\nroot_requires_role = true\n",
-            unix_now()
-        ),
-    )?;
+    if let Err(error) = fs::create_dir_all(&*state.state_dir).await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("identity: failed to create state directory: {error}\n"),
+        );
+    }
 
-    respond_text(stream, "201 Created", "identity: initialized\n")
+    let contents = format!(
+        "schema_version = 1\ninitialized_at_unix = {}\n\n[policy]\nplayers_require_github = false\ndevelopers_require_steam = true\ndevelopers_require_github = true\nroot_requires_role = true\n",
+        unix_now()
+    );
+    if let Err(error) = fs::write(registry, contents).await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("identity: failed to write registry: {error}\n"),
+        );
+    }
+
+    (StatusCode::CREATED, "identity: initialized\n".to_string())
 }
 
-fn export_identity(stream: &mut TcpStream, state_dir: &Path, request: &Request) -> io::Result<()> {
-    if !has_admin_token(request, "VAPOR_IDENTITY_ADMIN_TOKEN") {
-        return respond_text(
-            stream,
-            "401 Unauthorized",
-            "missing or invalid admin token\n",
+async fn export_identity(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+    if !authorized(&headers, &state.admin_token) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            "missing or invalid admin token\n".to_string(),
         );
     }
 
-    let registry = state_dir.join("registry.toml");
-    let body = fs::read_to_string(registry).unwrap_or_else(|_| {
+    let registry = state.state_dir.join("registry.toml");
+    let body = fs::read_to_string(registry).await.unwrap_or_else(|_| {
         "schema_version = 1\ninitialized = false\n# no identity registry has been initialized\n"
             .to_string()
     });
-    respond_text(stream, "200 OK", &body)
+    (StatusCode::OK, body)
 }
 
-fn has_admin_token(request: &Request, env_name: &str) -> bool {
-    let Ok(expected) = env::var(env_name) else {
+fn authorized(headers: &HeaderMap, expected: &Option<String>) -> bool {
+    let Some(expected) = expected else {
         return false;
     };
-    if expected.is_empty() {
-        return false;
-    }
-
-    request
-        .headers
-        .iter()
-        .any(|(name, value)| name == "authorization" && value == &format!("Bearer {expected}"))
-}
-
-fn read_request(stream: &mut TcpStream) -> io::Result<Option<Request>> {
-    let mut buffer = [0_u8; 8192];
-    let read = stream.read(&mut buffer)?;
-    if read == 0 {
-        return Ok(None);
-    }
-
-    let text = String::from_utf8_lossy(&buffer[..read]);
-    let mut lines = text.lines();
-    let Some(request_line) = lines.next() else {
-        return Ok(None);
-    };
-
-    let mut request_parts = request_line.split_whitespace();
-    let Some(method) = request_parts.next() else {
-        return Ok(None);
-    };
-    let Some(path) = request_parts.next() else {
-        return Ok(None);
-    };
-
-    let headers = lines
-        .take_while(|line| !line.is_empty())
-        .filter_map(|line| {
-            let (name, value) = line.split_once(':')?;
-            Some((name.trim().to_ascii_lowercase(), value.trim().to_string()))
-        })
-        .collect();
-
-    Ok(Some(Request {
-        method: method.to_string(),
-        path: path.to_string(),
-        headers,
-    }))
-}
-
-fn respond_text(stream: &mut TcpStream, status: &str, body: &str) -> io::Result<()> {
-    write!(
-        stream,
-        "HTTP/1.1 {status}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len()
-    )
-}
-
-fn toml_bool(value: bool) -> &'static str {
-    if value {
-        "true"
-    } else {
-        "false"
-    }
+    headers
+        .get(AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value == format!("Bearer {expected}"))
 }
 
 fn unix_now() -> u64 {
