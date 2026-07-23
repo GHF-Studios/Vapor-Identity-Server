@@ -125,6 +125,21 @@ Browser login uses Steam OpenID for Steam identity and GitHub OAuth web flow for
 GitHub linking. Steam OpenID does not require the Steam publisher Web API key.
 GitHub browser OAuth requires server-local client ID and client secret.
 
+## Steam authority model
+
+Vapor intentionally separates Steam identity from Steam publishing authority:
+
+- Steam OpenID proves browser account identity and gives the SteamID64 used as
+  the Vapor player profile anchor.
+- Steamworks Web API tickets prove an in-Steam client/session identity to the
+  backend. Server-side verification uses Steam WebAPI and app/publisher
+  credentials.
+- Steam ownership checks and publisher-scope checks belong to developer/root
+  authorization paths, not normal player login.
+- Workshop/app publishing is a separate privileged operation. A Vapor `root`
+  role can authorize the Vapor-side action, but Steam-side publishing still
+  needs the appropriate Steamworks/pipeline authority.
+
 The current session flow is:
 
 1. `POST /v1/auth/session/start` creates a 5-minute auth attempt.
@@ -149,3 +164,20 @@ verifies GitHub identity but does not create a GitHub-only profile.
 - diagnostics bundle storage;
 - homepage/legal content;
 - deployment orchestration.
+
+## Source layout
+
+```text
+src/main.rs               router/bootstrap only
+src/config.rs             environment-backed config and shared constants
+src/types.rs              request/response DTOs and app state
+src/status_handlers.rs    health/status/init/export/admin role routes
+src/session_handlers.rs   API auth-attempt and short session flow
+src/provider_handlers.rs  direct Steam/GitHub verification probes
+src/browser_handlers.rs   /login, /logout, /admin browser routes
+src/db.rs                 SQLite connection, migration, export counters
+src/auth_attempts.rs      short-lived auth/browser attempt persistence
+src/profiles.rs           Steam-anchored profiles, sessions, roles
+src/providers.rs          Steam/GitHub external verification calls
+src/util.rs               small shared helpers and HTML shell rendering
+```
