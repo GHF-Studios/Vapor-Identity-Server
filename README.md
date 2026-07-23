@@ -37,4 +37,3 @@ required.
 - diagnostics bundle storage;
 - homepage/legal content;
 - deployment orchestration.
-
