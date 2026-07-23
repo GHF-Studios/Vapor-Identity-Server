@@ -1,5 +1,5 @@
-use axum::extract::{DefaultBodyLimit, State};
-use axum::http::header::{AUTHORIZATION, COOKIE, SET_COOKIE};
+use axum::extract::{DefaultBodyLimit, Query, State};
+use axum::http::header::{AUTHORIZATION, COOKIE, LOCATION, SET_COOKIE};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
@@ -10,6 +10,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::{Row, SqlitePool};
+use std::collections::HashMap;
 use std::env;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -25,8 +26,10 @@ const DEFAULT_STEAM_APP_ID: u32 = 2_122_620;
 const DEFAULT_STEAM_AUTH_IDENTITY: &str = "vapor-identity";
 const MAX_AUTH_BODY_BYTES: usize = 16 * 1024;
 const AUTH_ATTEMPT_TTL_SECONDS: i64 = 5 * 60;
+const BROWSER_LOGIN_ATTEMPT_TTL_SECONDS: i64 = 10 * 60;
 const DASHBOARD_SESSION_TTL_SECONDS: i64 = 5 * 60;
 const SESSION_COOKIE: &str = "vapor_identity_session";
+const STEAM_OPENID_ENDPOINT: &str = "https://steamcommunity.com/openid/login";
 
 #[derive(Clone)]
 struct AppState {
@@ -43,9 +46,11 @@ struct AuthConfig {
     steam_auth_identity: String,
     steam_web_api_key: Option<String>,
     github_client_id: Option<String>,
+    github_client_secret: Option<String>,
     dashboard_password: Option<String>,
     cookie_secure: bool,
     cookie_path: String,
+    public_origin: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -57,6 +62,14 @@ struct SteamTicketRequest {
 #[derive(Deserialize)]
 struct GitHubTokenRequest {
     access_token: String,
+}
+
+#[derive(Deserialize)]
+struct GitHubCallbackQuery {
+    code: Option<String>,
+    state: Option<String>,
+    error: Option<String>,
+    error_description: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -181,6 +194,9 @@ struct AuthStatus {
     steam_auth_identity: String,
     github_identity_ready: bool,
     github_client_id_configured: bool,
+    github_browser_login_ready: bool,
+    github_client_secret_configured: bool,
+    steam_browser_login_ready: bool,
     dashboard_ready: bool,
     dashboard_basic_password_configured: bool,
     dashboard_session_ttl_seconds: i64,
@@ -252,6 +268,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/admin/root/grant", post(grant_root_role))
         .route("/v1/init", post(init))
         .route("/v1/export", get(export_identity))
+        .route("/login", get(login_page))
+        .route("/login/", get(login_page))
+        .route("/login/steam", get(login_steam_start))
+        .route("/login/steam/callback", get(login_steam_callback))
+        .route("/login/github", get(login_github_start))
+        .route("/login/github/callback", get(login_github_callback))
+        .route("/logout", get(logout))
         .route("/admin", get(admin_dashboard))
         .route("/admin/", get(admin_dashboard))
         .layer(DefaultBodyLimit::max(MAX_AUTH_BODY_BYTES))
@@ -280,6 +303,9 @@ fn read_auth_config() -> AuthConfig {
         github_client_id: env::var("VAPOR_IDENTITY_GITHUB_CLIENT_ID")
             .ok()
             .filter(|value| !value.is_empty()),
+        github_client_secret: env::var("VAPOR_IDENTITY_GITHUB_CLIENT_SECRET")
+            .ok()
+            .filter(|value| !value.is_empty()),
         dashboard_password: env::var("VAPOR_IDENTITY_DASHBOARD_PASSWORD")
             .ok()
             .filter(|value| !value.is_empty()),
@@ -295,6 +321,9 @@ fn read_auth_config() -> AuthConfig {
                     && !value.contains('\n')
             })
             .unwrap_or_else(|| "/api/identity".to_string()),
+        public_origin: env::var("VAPOR_IDENTITY_PUBLIC_ORIGIN")
+            .ok()
+            .filter(|value| valid_public_origin(value)),
     }
 }
 
@@ -322,9 +351,10 @@ async fn status(State(state): State<AppState>) -> impl IntoResponse {
         }
     };
     let body = format!(
-        "service = \"vapor-identity-server\"\ndatabase = \"sqlite\"\nschema_version = {schema_version}\ninitialized = {initialized}\nsteam_identity_ready = {}\ngithub_identity_ready = {}\ndashboard_ready = {}\ndashboard_session_ttl_seconds = {DASHBOARD_SESSION_TTL_SECONDS}\n",
+        "service = \"vapor-identity-server\"\ndatabase = \"sqlite\"\nschema_version = {schema_version}\ninitialized = {initialized}\nsteam_identity_ready = {}\nsteam_browser_login_ready = true\ngithub_identity_ready = {}\ngithub_browser_login_ready = {}\ndashboard_ready = {}\ndashboard_session_ttl_seconds = {DASHBOARD_SESSION_TTL_SECONDS}\n",
         state.config.steam_web_api_key.is_some(),
         state.config.github_client_id.is_some(),
+        github_browser_ready(&state.config),
         dashboard_identity_ready(&state.config)
     );
     (StatusCode::OK, body)
@@ -339,6 +369,9 @@ async fn auth_status(State(state): State<AppState>) -> Json<AuthStatus> {
         steam_auth_identity: state.config.steam_auth_identity.clone(),
         github_identity_ready: state.config.github_client_id.is_some(),
         github_client_id_configured: state.config.github_client_id.is_some(),
+        github_browser_login_ready: github_browser_ready(&state.config),
+        github_client_secret_configured: state.config.github_client_secret.is_some(),
+        steam_browser_login_ready: true,
         dashboard_ready: dashboard_identity_ready(&state.config),
         dashboard_basic_password_configured: state.config.dashboard_password.is_some(),
         dashboard_session_ttl_seconds: DASHBOARD_SESSION_TTL_SECONDS,
@@ -1103,21 +1136,10 @@ async fn auth_github_token(
         }
     };
 
-    let display_name = user.name.as_deref().unwrap_or(&user.login);
-    let profile_id = match link_github_account(&state.pool, &user, display_name).await {
-        Ok(profile_id) => profile_id,
-        Err(error) => {
-            return text_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                &format!("identity: failed to persist GitHub identity: {error}"),
-            );
-        }
-    };
-
     (
         StatusCode::OK,
         Json(IdentityAuthResponse {
-            profile_id,
+            profile_id: String::new(),
             provider: "github",
             steam_id64: None,
             github_user_id: Some(user.id),
@@ -1231,16 +1253,309 @@ async fn grant_root_role(
         .into_response()
 }
 
-async fn admin_dashboard(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
-    match root_session_profile_id(&state.pool, &headers).await {
-        Ok(Some(_profile_id)) => {}
-        Ok(None) => {
+async fn login_page(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+    let current = match current_profile_from_headers(&state.pool, &headers).await {
+        Ok(profile) => profile,
+        Err(error) => {
             return (
-                StatusCode::UNAUTHORIZED,
-                Html(unauthenticated_dashboard_html(&state.config)),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("identity: failed to load login state: {error}\n"),
             )
                 .into_response();
         }
+    };
+
+    Html(login_html(&state.config, current.as_ref())).into_response()
+}
+
+async fn login_steam_start(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let state_token = new_browser_login_state();
+    let now = unix_now_i64();
+    if let Err(error) = create_browser_login_attempt(
+        &state.pool,
+        &state_token,
+        "steam",
+        None,
+        now,
+        now + BROWSER_LOGIN_ATTEMPT_TTL_SECONDS,
+    )
+    .await
+    {
+        return text_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("identity: failed to start Steam login: {error}"),
+        );
+    }
+
+    let origin = public_origin(&state.config, &headers);
+    let return_to = format!("{origin}/login/steam/callback?state={state_token}");
+    let redirect = format!(
+        "{STEAM_OPENID_ENDPOINT}?openid.ns={}&openid.mode=checkid_setup&openid.claimed_id={}&openid.identity={}&openid.return_to={}&openid.realm={}",
+        percent_encode("http://specs.openid.net/auth/2.0"),
+        percent_encode("http://specs.openid.net/auth/2.0/identifier_select"),
+        percent_encode("http://specs.openid.net/auth/2.0/identifier_select"),
+        percent_encode(&return_to),
+        percent_encode(&format!("{origin}/")),
+    );
+
+    redirect_response(&redirect)
+}
+
+async fn login_steam_callback(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    let Some(state_token) = params
+        .get("state")
+        .filter(|value| valid_browser_state(value))
+    else {
+        return text_response(
+            StatusCode::BAD_REQUEST,
+            "identity: missing or invalid state",
+        );
+    };
+    match browser_login_attempt(&state.pool, state_token, "steam").await {
+        Ok(Some(_attempt)) => {}
+        Ok(None) => {
+            return text_response(
+                StatusCode::UNAUTHORIZED,
+                "identity: Steam login attempt is missing, expired, or already consumed",
+            );
+        }
+        Err(error) => {
+            return text_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("identity: failed to read Steam login attempt: {error}"),
+            );
+        }
+    }
+
+    let origin = public_origin(&state.config, &headers);
+    let expected_return_to = format!("{origin}/login/steam/callback?state={state_token}");
+    if params
+        .get("openid.return_to")
+        .is_none_or(|return_to| return_to != &expected_return_to)
+    {
+        return text_response(
+            StatusCode::UNAUTHORIZED,
+            "identity: Steam OpenID return_to did not match login attempt",
+        );
+    }
+
+    let steam_id64 = match verify_steam_openid(&state.http, &params).await {
+        Ok(steam_id64) => steam_id64,
+        Err(response) => return response,
+    };
+    let profile_id = match link_steam_account(&state.pool, &steam_id64).await {
+        Ok(profile_id) => profile_id,
+        Err(error) => {
+            return text_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("identity: failed to persist Steam profile: {error}"),
+            );
+        }
+    };
+    let (_session_id, token, _expires_at_unix) =
+        match create_identity_session(&state.pool, &profile_id).await {
+            Ok(session) => session,
+            Err(error) => {
+                return text_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &format!("identity: failed to create login session: {error}"),
+                );
+            }
+        };
+    if let Err(error) = consume_browser_login_attempt(&state.pool, state_token).await {
+        return text_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("identity: failed to consume Steam login attempt: {error}"),
+        );
+    }
+
+    redirect_with_cookie(&state.config, "/login", &token)
+}
+
+async fn login_github_start(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if !github_browser_ready(&state.config) {
+        return text_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "identity: GitHub browser login is not configured",
+        );
+    }
+    let Some(profile) = (match current_profile_from_headers(&state.pool, &headers).await {
+        Ok(profile) => profile,
+        Err(error) => {
+            return text_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("identity: failed to load login state: {error}"),
+            );
+        }
+    }) else {
+        return text_response(
+            StatusCode::UNAUTHORIZED,
+            "identity: sign in with Steam before linking GitHub",
+        );
+    };
+
+    let state_token = new_browser_login_state();
+    let now = unix_now_i64();
+    if let Err(error) = create_browser_login_attempt(
+        &state.pool,
+        &state_token,
+        "github",
+        Some(&profile.profile_id),
+        now,
+        now + BROWSER_LOGIN_ATTEMPT_TTL_SECONDS,
+    )
+    .await
+    {
+        return text_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("identity: failed to start GitHub login: {error}"),
+        );
+    }
+
+    let origin = public_origin(&state.config, &headers);
+    let redirect_uri = format!("{origin}/login/github/callback");
+    let client_id = state.config.github_client_id.as_deref().unwrap_or_default();
+    let redirect = format!(
+        "https://github.com/login/oauth/authorize?client_id={}&redirect_uri={}&scope={}&state={}&allow_signup=true",
+        percent_encode(client_id),
+        percent_encode(&redirect_uri),
+        percent_encode("read:user"),
+        percent_encode(&state_token),
+    );
+    redirect_response(&redirect)
+}
+
+async fn login_github_callback(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<GitHubCallbackQuery>,
+) -> Response {
+    if let Some(error) = query.error.as_deref() {
+        let detail = query.error_description.as_deref().unwrap_or(error);
+        return text_response(
+            StatusCode::UNAUTHORIZED,
+            &format!("identity: GitHub authorization failed: {detail}"),
+        );
+    }
+    let Some(code) = query.code.as_deref().filter(|value| !value.is_empty()) else {
+        return text_response(StatusCode::BAD_REQUEST, "identity: missing GitHub code");
+    };
+    let Some(state_token) = query
+        .state
+        .as_deref()
+        .filter(|value| valid_browser_state(value))
+    else {
+        return text_response(
+            StatusCode::BAD_REQUEST,
+            "identity: missing or invalid state",
+        );
+    };
+    let Some(client_id) = state.config.github_client_id.as_deref() else {
+        return text_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "identity: GitHub client ID is not configured",
+        );
+    };
+    let Some(client_secret) = state.config.github_client_secret.as_deref() else {
+        return text_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "identity: GitHub client secret is not configured",
+        );
+    };
+
+    let attempt = match browser_login_attempt(&state.pool, state_token, "github").await {
+        Ok(Some(attempt)) => attempt,
+        Ok(None) => {
+            return text_response(
+                StatusCode::UNAUTHORIZED,
+                "identity: GitHub login attempt is missing, expired, or already consumed",
+            );
+        }
+        Err(error) => {
+            return text_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("identity: failed to read GitHub login attempt: {error}"),
+            );
+        }
+    };
+    let Some(profile_id) = attempt.profile_id else {
+        return text_response(
+            StatusCode::UNAUTHORIZED,
+            "identity: GitHub browser login must attach to a Steam profile",
+        );
+    };
+    if current_profile_from_headers(&state.pool, &headers)
+        .await
+        .ok()
+        .flatten()
+        .is_none_or(|profile| profile.profile_id != profile_id)
+    {
+        return text_response(
+            StatusCode::UNAUTHORIZED,
+            "identity: GitHub login attempt does not match current Steam session",
+        );
+    }
+
+    let origin = public_origin(&state.config, &headers);
+    let redirect_uri = format!("{origin}/login/github/callback");
+    let token =
+        match exchange_github_web_code(&state.http, client_id, client_secret, code, &redirect_uri)
+            .await
+        {
+            Ok(token) => token,
+            Err(response) => return response,
+        };
+    let user = match verify_github_access_token(&state.http, &token).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    let display_name = user.name.as_deref().unwrap_or(&user.login);
+    if let Err(error) =
+        link_github_account_to_profile(&state.pool, &profile_id, &user, display_name).await
+    {
+        return text_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("identity: failed to link GitHub identity: {error}"),
+        );
+    }
+    if let Err(error) = consume_browser_login_attempt(&state.pool, state_token).await {
+        return text_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("identity: failed to consume GitHub login attempt: {error}"),
+        );
+    }
+
+    redirect_response("/login")
+}
+
+async fn logout(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+    if let Some(token) = session_token_from_headers(&headers) {
+        if let Err(error) = revoke_identity_session(&state.pool, &token).await {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("identity: failed to revoke session: {error}\n"),
+            )
+                .into_response();
+        }
+    }
+    (
+        StatusCode::SEE_OTHER,
+        [
+            (SET_COOKIE, expired_session_cookie(&state.config)),
+            (LOCATION, "/login".to_string()),
+        ],
+        "",
+    )
+        .into_response()
+}
+
+async fn admin_dashboard(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+    let current = match current_profile_from_headers(&state.pool, &headers).await {
+        Ok(profile) => profile,
         Err(error) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -1248,14 +1563,12 @@ async fn admin_dashboard(State(state): State<AppState>, headers: HeaderMap) -> i
             )
                 .into_response();
         }
-    }
-
-    if !dashboard_identity_ready(&state.config) {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Html(unconfigured_dashboard_html(&state.config)),
-        )
-            .into_response();
+    };
+    let Some(current) = current else {
+        return Html(admin_locked_html(None)).into_response();
+    };
+    if !current.root_authorized {
+        return Html(admin_locked_html(Some(&current))).into_response();
     }
 
     let profile_rows = match profile_rows(&state.pool).await {
@@ -1289,14 +1602,15 @@ async fn admin_dashboard(State(state): State<AppState>, headers: HeaderMap) -> i
          table{{border-collapse:collapse;width:100%}}td,th{{border:1px solid #ccc;padding:.4rem;text-align:left}}\
          code{{background:#f4f4f4;padding:.1rem .25rem;border-radius:.2rem}}</style>\
          <h1>Vapor Identity Admin</h1>\
-         <p>Access requires a short-lived Vapor identity session for a root profile with linked Steam and GitHub identities.</p>\
+         <p>Signed in as Steam profile <code>{}</code>. Root role is active.</p>\
+         <p><a href=\"/login\">Identity</a> · <a href=\"/logout\">Logout</a></p>\
          <h2>Readiness</h2>\
-         <ul><li>Steam verification configured: <code>{}</code></li>\
-         <li>GitHub client configured: <code>{}</code></li>\
+         <ul><li>Steam browser login: <code>true</code></li>\
+         <li>GitHub browser login configured: <code>{}</code></li>\
          <li>Dashboard session TTL: <code>{DASHBOARD_SESSION_TTL_SECONDS}s</code></li></ul>\
          <h2>Profiles</h2><table><thead><tr><th>Profile</th><th>Name</th><th>Steam</th><th>GitHub</th><th>Roles</th></tr></thead><tbody>{rows}</tbody></table>",
-        state.config.steam_web_api_key.is_some(),
-        state.config.github_client_id.is_some()
+        html_escape(&current.profile_id),
+        github_browser_ready(&state.config)
     ))
     .into_response()
 }
@@ -1425,6 +1739,18 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     .execute(&mut *tx)
     .await?;
     sqlx::query(
+        "CREATE TABLE IF NOT EXISTS browser_login_attempts (
+            state TEXT PRIMARY KEY,
+            flow TEXT NOT NULL CHECK (flow IN ('steam', 'github')),
+            profile_id TEXT REFERENCES profiles(id) ON DELETE CASCADE,
+            created_at_unix INTEGER NOT NULL,
+            expires_at_unix INTEGER NOT NULL,
+            consumed_at_unix INTEGER
+        )",
+    )
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
         "CREATE INDEX IF NOT EXISTS idx_auth_attempts_active
          ON auth_attempts (expires_at_unix, consumed_at_unix)",
     )
@@ -1433,6 +1759,12 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     sqlx::query(
         "CREATE INDEX IF NOT EXISTS idx_identity_sessions_profile
          ON identity_sessions (profile_id, expires_at_unix, revoked_at_unix)",
+    )
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_browser_login_attempts_active
+         ON browser_login_attempts (flow, expires_at_unix, consumed_at_unix)",
     )
     .execute(&mut *tx)
     .await?;
@@ -1446,6 +1778,13 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     sqlx::query(
         "INSERT OR IGNORE INTO schema_migrations (version, name, applied_at_unix)
          VALUES (2, 'auth_attempts_and_sessions', ?)",
+    )
+    .bind(unix_now_i64())
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "INSERT OR IGNORE INTO schema_migrations (version, name, applied_at_unix)
+         VALUES (3, 'browser_login_attempts', ?)",
     )
     .bind(unix_now_i64())
     .execute(&mut *tx)
@@ -1508,6 +1847,7 @@ async fn export_identity_state(pool: &SqlitePool, db_path: &Path) -> Result<Stri
     let audit_event_count = count_rows(pool, "audit_events").await?;
     let auth_attempt_count = count_rows(pool, "auth_attempts").await?;
     let session_count = count_rows(pool, "identity_sessions").await?;
+    let browser_login_attempt_count = count_rows(pool, "browser_login_attempts").await?;
 
     let mut body = String::new();
     body.push_str("database = \"sqlite\"\n");
@@ -1535,6 +1875,9 @@ async fn export_identity_state(pool: &SqlitePool, db_path: &Path) -> Result<Stri
     body.push_str(&format!("audit_events = {audit_event_count}\n"));
     body.push_str(&format!("auth_attempts = {auth_attempt_count}\n"));
     body.push_str(&format!("identity_sessions = {session_count}\n"));
+    body.push_str(&format!(
+        "browser_login_attempts = {browser_login_attempt_count}\n"
+    ));
     Ok(body)
 }
 
@@ -1547,9 +1890,71 @@ async fn count_rows(pool: &SqlitePool, table: &str) -> Result<i64, sqlx::Error> 
         "audit_events" => "SELECT COUNT(*) FROM audit_events",
         "auth_attempts" => "SELECT COUNT(*) FROM auth_attempts",
         "identity_sessions" => "SELECT COUNT(*) FROM identity_sessions",
+        "browser_login_attempts" => "SELECT COUNT(*) FROM browser_login_attempts",
         _ => unreachable!("table name is constrained by caller"),
     };
     sqlx::query_scalar(sql).fetch_one(pool).await
+}
+
+struct BrowserLoginAttempt {
+    profile_id: Option<String>,
+}
+
+async fn create_browser_login_attempt(
+    pool: &SqlitePool,
+    state: &str,
+    flow: &str,
+    profile_id: Option<&str>,
+    now: i64,
+    expires_at_unix: i64,
+) -> Result<(), sqlx::Error> {
+    prune_expired_auth_state(pool, now).await?;
+    sqlx::query(
+        "INSERT INTO browser_login_attempts
+            (state, flow, profile_id, created_at_unix, expires_at_unix)
+         VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind(state)
+    .bind(flow)
+    .bind(profile_id)
+    .bind(now)
+    .bind(expires_at_unix)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+async fn browser_login_attempt(
+    pool: &SqlitePool,
+    state: &str,
+    flow: &str,
+) -> Result<Option<BrowserLoginAttempt>, sqlx::Error> {
+    let now = unix_now_i64();
+    let row = sqlx::query(
+        "SELECT profile_id
+         FROM browser_login_attempts
+         WHERE state = ?
+           AND flow = ?
+           AND expires_at_unix > ?
+           AND consumed_at_unix IS NULL",
+    )
+    .bind(state)
+    .bind(flow)
+    .bind(now)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|row| BrowserLoginAttempt {
+        profile_id: row.get("profile_id"),
+    }))
+}
+
+async fn consume_browser_login_attempt(pool: &SqlitePool, state: &str) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE browser_login_attempts SET consumed_at_unix = ? WHERE state = ?")
+        .bind(unix_now_i64())
+        .bind(state)
+        .execute(pool)
+        .await?;
+    Ok(())
 }
 
 async fn create_auth_attempt(
@@ -1576,6 +1981,13 @@ async fn create_auth_attempt(
 async fn prune_expired_auth_state(pool: &SqlitePool, now: i64) -> Result<(), sqlx::Error> {
     sqlx::query(
         "DELETE FROM auth_attempts WHERE expires_at_unix <= ? OR consumed_at_unix IS NOT NULL",
+    )
+    .bind(now)
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "DELETE FROM browser_login_attempts
+         WHERE expires_at_unix <= ? OR consumed_at_unix IS NOT NULL",
     )
     .bind(now)
     .execute(pool)
@@ -1821,9 +2233,11 @@ async fn link_verified_auth_attempt(
         }
     }
 
-    let profile_id = steam_profile
-        .or(github_profile)
-        .unwrap_or_else(new_profile_id);
+    let profile_id = match (steam_profile, github_profile) {
+        (Some(profile_id), None) | (Some(profile_id), Some(_)) => profile_id,
+        (None, Some(_)) => return Err(AuthFinishError::ConflictingProfiles),
+        (None, None) => new_profile_id(),
+    };
     let display_name = github_name.as_deref().unwrap_or(&github_login);
 
     let mut tx = pool.begin().await?;
@@ -1993,6 +2407,108 @@ async fn create_identity_session(
     Ok((session_id, token, expires_at_unix))
 }
 
+struct CurrentProfile {
+    profile_id: String,
+    display_name: Option<String>,
+    steam_id64: Option<String>,
+    github_login: Option<String>,
+    roles: Vec<String>,
+    root_authorized: bool,
+}
+
+async fn current_profile_from_headers(
+    pool: &SqlitePool,
+    headers: &HeaderMap,
+) -> Result<Option<CurrentProfile>, sqlx::Error> {
+    let Some(profile_id) = session_profile_id(pool, headers).await? else {
+        return Ok(None);
+    };
+    profile_by_id(pool, &profile_id).await
+}
+
+async fn session_profile_id(
+    pool: &SqlitePool,
+    headers: &HeaderMap,
+) -> Result<Option<String>, sqlx::Error> {
+    let Some(token) = session_token_from_headers(headers) else {
+        return Ok(None);
+    };
+    let token_hash = hash_session_token(&token);
+    let now = unix_now_i64();
+    sqlx::query_scalar::<_, String>(
+        "SELECT s.profile_id
+         FROM identity_sessions s
+         JOIN profiles p ON p.id = s.profile_id
+         WHERE s.token_hash = ?
+           AND s.expires_at_unix > ?
+           AND s.revoked_at_unix IS NULL
+           AND p.disabled_at_unix IS NULL",
+    )
+    .bind(token_hash)
+    .bind(now)
+    .fetch_optional(pool)
+    .await
+}
+
+async fn profile_by_id(
+    pool: &SqlitePool,
+    profile_id: &str,
+) -> Result<Option<CurrentProfile>, sqlx::Error> {
+    let Some(row) = sqlx::query(
+        "SELECT
+            p.id AS profile_id,
+            p.display_name AS display_name,
+            group_concat(DISTINCT s.steam_id64) AS steam_ids,
+            group_concat(DISTINCT g.github_login) AS github_logins,
+            group_concat(DISTINCT r.role) AS roles
+         FROM profiles p
+         LEFT JOIN steam_accounts s ON s.profile_id = p.id
+         LEFT JOIN github_accounts g ON g.profile_id = p.id
+         LEFT JOIN profile_roles r ON r.profile_id = p.id AND r.revoked_at_unix IS NULL
+         WHERE p.id = ? AND p.disabled_at_unix IS NULL
+         GROUP BY p.id, p.display_name",
+    )
+    .bind(profile_id)
+    .fetch_optional(pool)
+    .await?
+    else {
+        return Ok(None);
+    };
+
+    let steam_id64 = first_csv(row.get::<Option<String>, _>("steam_ids").as_deref());
+    let github_login = first_csv(row.get::<Option<String>, _>("github_logins").as_deref());
+    let roles = row
+        .get::<Option<String>, _>("roles")
+        .as_deref()
+        .map(csv_values)
+        .unwrap_or_default();
+    let root_authorized =
+        roles.iter().any(|role| role == "root") && steam_id64.is_some() && github_login.is_some();
+
+    Ok(Some(CurrentProfile {
+        profile_id: row.get("profile_id"),
+        display_name: row.get("display_name"),
+        steam_id64,
+        github_login,
+        roles,
+        root_authorized,
+    }))
+}
+
+async fn revoke_identity_session(pool: &SqlitePool, token: &str) -> Result<(), sqlx::Error> {
+    let token_hash = hash_session_token(token);
+    sqlx::query(
+        "UPDATE identity_sessions
+         SET revoked_at_unix = COALESCE(revoked_at_unix, ?)
+         WHERE token_hash = ?",
+    )
+    .bind(unix_now_i64())
+    .bind(token_hash)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 async fn root_session_profile_id(
     pool: &SqlitePool,
     headers: &HeaderMap,
@@ -2094,19 +2610,23 @@ async fn link_steam_account(pool: &SqlitePool, steam_id64: &str) -> Result<Strin
     Ok(profile_id)
 }
 
-async fn link_github_account(
+async fn link_github_account_to_profile(
     pool: &SqlitePool,
+    profile_id: &str,
     user: &GitHubUser,
     display_name: &str,
-) -> Result<String, sqlx::Error> {
+) -> Result<(), sqlx::Error> {
     let now = unix_now_i64();
-    if let Some(profile_id) = sqlx::query_scalar::<_, String>(
+    if let Some(existing_profile_id) = sqlx::query_scalar::<_, String>(
         "SELECT profile_id FROM github_accounts WHERE github_user_id = ?",
     )
     .bind(user.id)
     .fetch_optional(pool)
     .await?
     {
+        if existing_profile_id != profile_id {
+            return Err(sqlx::Error::RowNotFound);
+        }
         sqlx::query(
             "UPDATE github_accounts
              SET github_login = ?, verified_at_unix = ?
@@ -2119,18 +2639,16 @@ async fn link_github_account(
         .await?;
         sqlx::query("UPDATE profiles SET display_name = ? WHERE id = ? AND display_name IS NULL")
             .bind(display_name)
-            .bind(&profile_id)
+            .bind(profile_id)
             .execute(pool)
             .await?;
-        return Ok(profile_id);
+        return Ok(());
     }
 
-    let profile_id = new_profile_id();
     let mut tx = pool.begin().await?;
-    sqlx::query("INSERT INTO profiles (id, display_name, created_at_unix) VALUES (?, ?, ?)")
-        .bind(&profile_id)
+    sqlx::query("UPDATE profiles SET display_name = COALESCE(display_name, ?) WHERE id = ?")
         .bind(display_name)
-        .bind(now)
+        .bind(profile_id)
         .execute(&mut *tx)
         .await?;
     sqlx::query(
@@ -2139,7 +2657,7 @@ async fn link_github_account(
     )
     .bind(user.id)
     .bind(&user.login)
-    .bind(&profile_id)
+    .bind(profile_id)
     .bind(now)
     .bind(now)
     .execute(&mut *tx)
@@ -2148,7 +2666,7 @@ async fn link_github_account(
         "INSERT INTO audit_events (event_type, subject_profile_id, created_at_unix, detail)
          VALUES ('github_identity_linked', ?, ?, ?)",
     )
-    .bind(&profile_id)
+    .bind(profile_id)
     .bind(now)
     .bind(format!(
         "github_user_id={} github_login={}",
@@ -2157,7 +2675,7 @@ async fn link_github_account(
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
-    Ok(profile_id)
+    Ok(())
 }
 
 struct ProfileRow {
@@ -2309,6 +2827,147 @@ async fn verify_github_access_token(
     })
 }
 
+async fn verify_steam_openid(
+    http: &reqwest::Client,
+    params: &HashMap<String, String>,
+) -> Result<String, Response> {
+    if params
+        .get("openid.op_endpoint")
+        .is_none_or(|value| value != STEAM_OPENID_ENDPOINT)
+    {
+        return Err(text_response(
+            StatusCode::UNAUTHORIZED,
+            "identity: Steam OpenID endpoint did not match Steam",
+        ));
+    }
+
+    let claimed_id = params
+        .get("openid.claimed_id")
+        .ok_or_else(|| text_response(StatusCode::BAD_REQUEST, "identity: missing claimed_id"))?;
+    let steam_id64 = steam_id_from_openid_claim(claimed_id).ok_or_else(|| {
+        text_response(
+            StatusCode::UNAUTHORIZED,
+            "identity: Steam OpenID claimed_id did not contain SteamID64",
+        )
+    })?;
+    if params
+        .get("openid.identity")
+        .is_none_or(|identity| identity != claimed_id)
+    {
+        return Err(text_response(
+            StatusCode::UNAUTHORIZED,
+            "identity: Steam OpenID identity did not match claimed_id",
+        ));
+    }
+
+    let mut form = Vec::new();
+    for (key, value) in params {
+        if key.starts_with("openid.") {
+            if key == "openid.mode" {
+                form.push((key.clone(), "check_authentication".to_string()));
+            } else {
+                form.push((key.clone(), value.clone()));
+            }
+        }
+    }
+    if !form.iter().any(|(key, _)| key == "openid.mode") {
+        form.push((
+            "openid.mode".to_string(),
+            "check_authentication".to_string(),
+        ));
+    }
+
+    let response = http
+        .post(STEAM_OPENID_ENDPOINT)
+        .header(USER_AGENT, "Vapor-Identity-Server/0.1")
+        .form(&form)
+        .send()
+        .await
+        .map_err(|error| {
+            text_response(
+                StatusCode::BAD_GATEWAY,
+                &format!("identity: Steam OpenID verification failed: {error}"),
+            )
+        })?;
+    if !response.status().is_success() {
+        return Err(text_response(
+            StatusCode::BAD_GATEWAY,
+            &format!(
+                "identity: Steam OpenID verification returned {}",
+                response.status()
+            ),
+        ));
+    }
+    let body = response.text().await.map_err(|error| {
+        text_response(
+            StatusCode::BAD_GATEWAY,
+            &format!("identity: failed to read Steam OpenID response: {error}"),
+        )
+    })?;
+    if !body.lines().any(|line| line.trim() == "is_valid:true") {
+        return Err(text_response(
+            StatusCode::UNAUTHORIZED,
+            "identity: Steam OpenID response was not valid",
+        ));
+    }
+
+    Ok(steam_id64)
+}
+
+async fn exchange_github_web_code(
+    http: &reqwest::Client,
+    client_id: &str,
+    client_secret: &str,
+    code: &str,
+    redirect_uri: &str,
+) -> Result<String, Response> {
+    let response = http
+        .post("https://github.com/login/oauth/access_token")
+        .header(ACCEPT, "application/json")
+        .header(USER_AGENT, "Vapor-Identity-Server/0.1")
+        .form(&[
+            ("client_id", client_id),
+            ("client_secret", client_secret),
+            ("code", code),
+            ("redirect_uri", redirect_uri),
+        ])
+        .send()
+        .await
+        .map_err(|error| {
+            text_response(
+                StatusCode::BAD_GATEWAY,
+                &format!("identity: GitHub code exchange failed: {error}"),
+            )
+        })?;
+    if !response.status().is_success() {
+        return Err(text_response(
+            StatusCode::UNAUTHORIZED,
+            &format!("identity: GitHub rejected code with {}", response.status()),
+        ));
+    }
+    let token_response = response
+        .json::<GitHubAccessTokenResponse>()
+        .await
+        .map_err(|error| {
+            text_response(
+                StatusCode::BAD_GATEWAY,
+                &format!("identity: failed to decode GitHub code exchange response: {error}"),
+            )
+        })?;
+    if let Some(error) = token_response.error.as_deref() {
+        return Err(text_response(
+            StatusCode::UNAUTHORIZED,
+            &format!("identity: GitHub code exchange returned {error}"),
+        ));
+    }
+    token_response.access_token.ok_or_else(|| {
+        text_response(
+            StatusCode::BAD_GATEWAY,
+            "identity: GitHub code exchange did not return an access token",
+        )
+    })
+}
+
 fn authorized(headers: &HeaderMap, expected: &Option<String>) -> bool {
     let Some(expected) = expected else {
         return false;
@@ -2351,6 +3010,14 @@ fn session_cookie(config: &AuthConfig, token: &str, max_age_seconds: i64) -> Str
     )
 }
 
+fn expired_session_cookie(config: &AuthConfig) -> String {
+    let secure = if config.cookie_secure { "; Secure" } else { "" };
+    format!(
+        "{SESSION_COOKIE}=; Path={}; Max-Age=0; HttpOnly; SameSite=Lax{secure}",
+        config.cookie_path
+    )
+}
+
 fn hash_session_token(token: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(token.as_bytes());
@@ -2359,48 +3026,202 @@ fn hash_session_token(token: &str) -> String {
 }
 
 fn dashboard_identity_ready(config: &AuthConfig) -> bool {
-    config.steam_web_api_key.is_some() && config.github_client_id.is_some()
+    github_browser_ready(config)
+}
+
+fn github_browser_ready(config: &AuthConfig) -> bool {
+    config.github_client_id.is_some() && config.github_client_secret.is_some()
 }
 
 fn github_device_ready(config: &AuthConfig) -> bool {
     config.github_client_id.is_some()
 }
 
-fn unauthenticated_dashboard_html(config: &AuthConfig) -> String {
+fn login_html(config: &AuthConfig, current: Option<&CurrentProfile>) -> String {
+    let body = if let Some(profile) = current {
+        let roles = display_roles(profile);
+        let github = profile.github_login.as_deref().unwrap_or("not linked");
+        let github_action = if profile.github_login.is_some() {
+            "<p>GitHub identity is linked.</p>".to_string()
+        } else if github_browser_ready(config) {
+            "<p><a href=\"/login/github\">Link GitHub account</a></p>".to_string()
+        } else {
+            "<p>GitHub browser login is not configured yet. Steam/player login still works.</p>"
+                .to_string()
+        };
+        format!(
+            "<p>Signed in as Steam profile <code>{}</code>.</p>\
+             <dl><dt>Display name</dt><dd>{}</dd>\
+             <dt>SteamID64</dt><dd>{}</dd>\
+             <dt>GitHub</dt><dd>{}</dd>\
+             <dt>Roles</dt><dd>{}</dd></dl>\
+             {github_action}\
+             <p><a href=\"/admin\">Open admin dashboard</a> · <a href=\"/logout\">Logout</a></p>",
+            html_escape(&profile.profile_id),
+            html_escape(profile.display_name.as_deref().unwrap_or("")),
+            html_escape(profile.steam_id64.as_deref().unwrap_or("")),
+            html_escape(github),
+            html_escape(&roles),
+        )
+    } else {
+        "<p>Vapor profiles are anchored by Steam identity. No Vapor username or password is required.</p>\
+         <p><a href=\"/login/steam\">Sign in / register with Steam</a></p>\
+         <p>GitHub is linked after Steam login when development or root access is needed.</p>"
+            .to_string()
+    };
+
     format!(
-        "<!doctype html><meta charset=\"utf-8\"><title>Vapor Identity Admin</title>\
+        "<!doctype html><meta charset=\"utf-8\"><title>Vapor Login</title>\
          <style>body{{max-width:840px;margin:3rem auto;padding:0 1.5rem;font:16px/1.5 system-ui,sans-serif}}\
-         code{{background:#f4f4f4;padding:.1rem .25rem;border-radius:.2rem}}\
-         pre{{background:#f7f7f7;padding:1rem;overflow:auto}}</style>\
-         <h1>Vapor Identity Admin</h1>\
-         <p>No valid root identity session is present.</p>\
-         <h2>Required auth state</h2>\
-         <ul><li>Steam verification configured: <code>{}</code></li>\
+         code{{background:#f4f4f4;padding:.1rem .25rem;border-radius:.2rem}}dt{{font-weight:700}}dd{{margin:0 0 .5rem 0}}</style>\
+         <h1>Vapor Login</h1>{body}\
+         <h2>Readiness</h2>\
+         <ul><li>Steam browser login: <code>true</code></li>\
+         <li>GitHub browser login configured: <code>{}</code></li>\
          <li>GitHub Device Flow configured: <code>{}</code></li>\
          <li>Session TTL: <code>{DASHBOARD_SESSION_TTL_SECONDS}s</code></li></ul>\
-         <h2>Flow</h2>\
-         <ol><li>Create an auth attempt with <code>POST /v1/auth/session/start</code>.</li>\
-         <li>Attach Steam proof with <code>POST /v1/auth/session/steam/ticket</code>.</li>\
-         <li>Attach GitHub proof with either <code>/github/device/start</code> + <code>/github/device/poll</code>, or <code>/github/token</code>.</li>\
-         <li>Finish with <code>POST /v1/auth/session/finish</code>. The resulting profile must have an active <code>root</code> role.</li></ol>\
-         <p>This page intentionally does not show profile data until the identity session exists and is still valid.</p>",
-        config.steam_web_api_key.is_some(),
+         <p><a href=\"/\">Home</a></p>",
+        github_browser_ready(config),
         config.github_client_id.is_some()
     )
 }
 
-fn unconfigured_dashboard_html(config: &AuthConfig) -> String {
+fn admin_locked_html(current: Option<&CurrentProfile>) -> String {
+    let body = if let Some(profile) = current {
+        format!(
+            "<p>You are signed in as Steam profile <code>{}</code>, but this profile is not authorized for root/admin access.</p>\
+             <dl><dt>SteamID64</dt><dd>{}</dd><dt>GitHub</dt><dd>{}</dd><dt>Roles</dt><dd>{}</dd></dl>\
+             <p><a href=\"/login\">Manage identity</a> · <a href=\"/logout\">Logout</a></p>",
+            html_escape(&profile.profile_id),
+            html_escape(profile.steam_id64.as_deref().unwrap_or("")),
+            html_escape(profile.github_login.as_deref().unwrap_or("not linked")),
+            html_escape(&display_roles(profile)),
+        )
+    } else {
+        "<p>The admin dashboard is publicly reachable, but locked. Sign in to check whether your Steam profile has admin access.</p>\
+         <p><a href=\"/login\">Login / register</a></p>"
+            .to_string()
+    };
+
     format!(
         "<!doctype html><meta charset=\"utf-8\"><title>Vapor Identity Admin</title>\
          <style>body{{max-width:840px;margin:3rem auto;padding:0 1.5rem;font:16px/1.5 system-ui,sans-serif}}\
-         code{{background:#f4f4f4;padding:.1rem .25rem;border-radius:.2rem}}</style>\
-         <h1>Vapor Identity Admin</h1>\
-         <p>The dashboard requires Steam and GitHub verification configuration before identity sessions can be trusted.</p>\
-         <ul><li>Steam verification configured: <code>{}</code></li>\
-         <li>GitHub client configured: <code>{}</code></li></ul>",
-        config.steam_web_api_key.is_some(),
-        config.github_client_id.is_some()
+         code{{background:#f4f4f4;padding:.1rem .25rem;border-radius:.2rem}}dt{{font-weight:700}}dd{{margin:0 0 .5rem 0}}</style>\
+         <h1>Vapor Identity Admin</h1>{body}\
+         <p>Admin access requires linked Steam and GitHub identities plus the <code>root</code> role.</p>"
     )
+}
+
+fn display_roles(profile: &CurrentProfile) -> String {
+    let mut roles = vec!["player".to_string()];
+    roles.extend(profile.roles.iter().cloned());
+    roles.sort();
+    roles.dedup();
+    roles.join(", ")
+}
+
+fn redirect_response(location: &str) -> Response {
+    (
+        StatusCode::SEE_OTHER,
+        [(LOCATION, location.to_string())],
+        "",
+    )
+        .into_response()
+}
+
+fn redirect_with_cookie(config: &AuthConfig, location: &str, token: &str) -> Response {
+    (
+        StatusCode::SEE_OTHER,
+        [
+            (
+                SET_COOKIE,
+                session_cookie(config, token, DASHBOARD_SESSION_TTL_SECONDS),
+            ),
+            (LOCATION, location.to_string()),
+        ],
+        "",
+    )
+        .into_response()
+}
+
+fn public_origin(config: &AuthConfig, headers: &HeaderMap) -> String {
+    if let Some(origin) = config.public_origin.as_deref() {
+        return origin.to_string();
+    }
+    let proto = headers
+        .get("x-forwarded-proto")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| matches!(*value, "http" | "https"))
+        .unwrap_or("http");
+    let host = headers
+        .get("x-forwarded-host")
+        .or_else(|| headers.get("host"))
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| valid_public_host(value))
+        .unwrap_or("127.0.0.1:7113");
+    format!("{proto}://{host}")
+}
+
+fn valid_public_origin(value: &str) -> bool {
+    (value.starts_with("http://") || value.starts_with("https://"))
+        && !value.ends_with('/')
+        && !value.contains(';')
+        && !value.contains('\r')
+        && !value.contains('\n')
+}
+
+fn valid_public_host(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 255
+        && !value.contains('/')
+        && !value.contains('\\')
+        && !value.contains(';')
+        && !value.contains('\r')
+        && !value.contains('\n')
+}
+
+fn percent_encode(value: &str) -> String {
+    let mut encoded = String::new();
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                encoded.push(byte as char);
+            }
+            _ => encoded.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    encoded
+}
+
+fn steam_id_from_openid_claim(value: &str) -> Option<String> {
+    let steam_id = value
+        .strip_prefix("https://steamcommunity.com/openid/id/")
+        .or_else(|| value.strip_prefix("http://steamcommunity.com/openid/id/"))?;
+    if steam_id.bytes().all(|byte| byte.is_ascii_digit()) {
+        Some(steam_id.to_string())
+    } else {
+        None
+    }
+}
+
+fn first_csv(value: Option<&str>) -> Option<String> {
+    value
+        .and_then(|value| value.split(',').find(|part| !part.trim().is_empty()))
+        .map(|value| value.trim().to_string())
+}
+
+fn csv_values(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .filter_map(|part| {
+            let part = part.trim();
+            if part.is_empty() {
+                None
+            } else {
+                Some(part.to_string())
+            }
+        })
+        .collect()
 }
 
 fn valid_profile_id(value: &str) -> bool {
@@ -2414,6 +3235,14 @@ fn valid_profile_id(value: &str) -> bool {
 fn valid_auth_attempt_id(value: &str) -> bool {
     value.starts_with("auth-")
         && value.len() <= 80
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+}
+
+fn valid_browser_state(value: &str) -> bool {
+    value.starts_with("login-")
+        && value.len() <= 96
         && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
@@ -2449,6 +3278,10 @@ fn new_profile_id() -> String {
 
 fn new_auth_attempt_id() -> String {
     format!("auth-{}", Uuid::new_v4())
+}
+
+fn new_browser_login_state() -> String {
+    format!("login-{}-{}", Uuid::new_v4(), Uuid::new_v4())
 }
 
 fn new_session_id() -> String {
