@@ -50,8 +50,13 @@ VAPOR_IDENTITY_ADMIN_TOKEN=<server-local secret>
 ```text
 GET  /healthz
 GET  /v1/status
+GET  /v1/auth/status
+POST /v1/auth/steam/ticket
+POST /v1/auth/github/token
+GET  /v1/admin/profiles
 POST /v1/init
 GET  /v1/export
+GET  /admin
 ```
 
 Protected routes expect:
@@ -59,6 +64,27 @@ Protected routes expect:
 ```text
 Authorization: Bearer <VAPOR_IDENTITY_ADMIN_TOKEN>
 ```
+
+`GET /admin` is a small read-only dashboard protected by HTTP Basic auth using
+username `root` and `VAPOR_IDENTITY_DASHBOARD_PASSWORD`. Use it only over HTTPS
+or through an SSH tunnel; the temporary pre-DNS HTTP fallback is not an admin
+surface.
+
+## Auth configuration
+
+Server-local env only:
+
+```text
+VAPOR_IDENTITY_STEAM_APP_ID=2122620
+VAPOR_IDENTITY_STEAM_AUTH_IDENTITY=vapor-identity
+VAPOR_IDENTITY_STEAM_WEB_API_KEY=
+VAPOR_IDENTITY_GITHUB_CLIENT_ID=
+```
+
+Steam ticket verification uses Steamworks `GetAuthTicketForWebApi` on the
+client and `ISteamUserAuth/AuthenticateUserTicket` on the server. GitHub
+developer linking expects a GitHub Device Flow/OAuth token from a client, then
+verifies it against GitHub before storing only the GitHub user id/login.
 
 Real Steam and GitHub account linking is planned but not implemented in this
 initial scaffold.
