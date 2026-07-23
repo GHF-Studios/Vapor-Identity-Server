@@ -320,7 +320,7 @@ fn read_auth_config() -> AuthConfig {
                     && !value.contains('\r')
                     && !value.contains('\n')
             })
-            .unwrap_or_else(|| "/api/identity".to_string()),
+            .unwrap_or_else(|| "/".to_string()),
         public_origin: env::var("VAPOR_IDENTITY_PUBLIC_ORIGIN")
             .ok()
             .filter(|value| valid_public_origin(value)),
