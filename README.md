@@ -2,7 +2,7 @@
 
 Identity and role authority service for Vapor.
 
-Initial implementation uses Axum/Tokio.
+Initial implementation uses Axum/Tokio with SQLite through SQLx.
 
 ## Responsibility
 
@@ -30,8 +30,20 @@ Expected public API route behind the root reverse proxy:
 
 ## State
 
-Owns identity registry, linked accounts, roles, and auth/session metadata as
-required.
+Owns identity database state: linked accounts, roles, policy metadata, and
+auth/session metadata as required.
+
+The initial single-VPS database is SQLite, not an ad-hoc filesystem registry.
+The server creates and migrates the database on startup.
+
+Runtime environment:
+
+```text
+VAPOR_IDENTITY_BIND=127.0.0.1:7113
+VAPOR_IDENTITY_STATE=/var/lib/vapor-server/identity
+VAPOR_IDENTITY_DB=/var/lib/vapor-server/identity/identity.sqlite3
+VAPOR_IDENTITY_ADMIN_TOKEN=<server-local secret>
+```
 
 ## Initial routes
 

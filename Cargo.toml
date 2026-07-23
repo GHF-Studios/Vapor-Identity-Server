@@ -6,4 +6,5 @@ publish = false
 
 [dependencies]
 axum = "0.8"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite"] }
 tokio = { version = "1", features = ["fs", "macros", "net", "rt-multi-thread"] }
