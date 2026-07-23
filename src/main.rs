@@ -482,7 +482,7 @@ async fn admin_dashboard(State(state): State<AppState>, headers: HeaderMap) -> i
          table{{border-collapse:collapse;width:100%}}td,th{{border:1px solid #ccc;padding:.4rem;text-align:left}}\
          code{{background:#f4f4f4;padding:.1rem .25rem;border-radius:.2rem}}</style>\
          <h1>Vapor Identity Admin</h1>\
-         <p>Use over HTTPS or an SSH tunnel only. The pre-DNS HTTP fallback is not an admin surface.</p>\
+         <p>Closed pre-alpha HTTP access is temporarily allowed before DNS is ready. Switch this dashboard to HTTPS once DNS is active.</p>\
          <h2>Readiness</h2>\
          <ul><li>Steam verification configured: <code>{}</code></li>\
          <li>GitHub client configured: <code>{}</code></li></ul>\

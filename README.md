@@ -66,9 +66,9 @@ Authorization: Bearer <VAPOR_IDENTITY_ADMIN_TOKEN>
 ```
 
 `GET /admin` is a small read-only dashboard protected by HTTP Basic auth using
-username `root` and `VAPOR_IDENTITY_DASHBOARD_PASSWORD`. Use it only over HTTPS
-or through an SSH tunnel; the temporary pre-DNS HTTP fallback is not an admin
-surface.
+username `root` and `VAPOR_IDENTITY_DASHBOARD_PASSWORD`. Closed pre-alpha HTTP
+access is temporarily allowed before DNS is ready. Move the dashboard to HTTPS
+once DNS is active.
 
 ## Auth configuration
 
