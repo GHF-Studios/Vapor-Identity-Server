@@ -457,7 +457,6 @@ pub(crate) async fn link_github_account_to_profile(
 }
 
 pub(crate) struct ProfileRow {
-    pub(crate) profile_id: String,
     pub(crate) display_name: Option<String>,
     pub(crate) steam_ids: Option<String>,
     pub(crate) github_logins: Option<String>,
@@ -467,7 +466,6 @@ pub(crate) struct ProfileRow {
 pub(crate) async fn profile_rows(pool: &SqlitePool) -> Result<Vec<ProfileRow>, sqlx::Error> {
     let rows = sqlx::query(
         "SELECT
-            p.id AS profile_id,
             p.display_name AS display_name,
             group_concat(DISTINCT s.steam_id64) AS steam_ids,
             group_concat(DISTINCT g.github_login) AS github_logins,
@@ -485,7 +483,6 @@ pub(crate) async fn profile_rows(pool: &SqlitePool) -> Result<Vec<ProfileRow>, s
     Ok(rows
         .into_iter()
         .map(|row| ProfileRow {
-            profile_id: row.get("profile_id"),
             display_name: row.get("display_name"),
             steam_ids: row.get("steam_ids"),
             github_logins: row.get("github_logins"),
@@ -505,7 +502,6 @@ pub(crate) async fn profile_listing(pool: &SqlitePool) -> Result<String, sqlx::E
     body.clear();
     for row in rows {
         body.push_str("[[profiles]]\n");
-        body.push_str(&format!("id = {}\n", toml_string(&row.profile_id)));
         body.push_str(&format!(
             "display_name = {}\n",
             toml_string(row.display_name.as_deref().unwrap_or(""))
