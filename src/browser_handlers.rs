@@ -2,8 +2,10 @@ use axum::extract::{Query, State};
 use axum::http::header::{LOCATION, SET_COOKIE};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
+use axum::Form;
 use std::collections::HashMap;
 
+use crate::admin_handlers::grant_role_request;
 use crate::config::{
     BROWSER_LOGIN_ATTEMPT_TTL_SECONDS, DASHBOARD_SESSION_TTL_SECONDS, STEAM_OPENID_ENDPOINT,
 };
@@ -329,6 +331,7 @@ pub(crate) async fn logout(State(state): State<AppState>, headers: HeaderMap) ->
 pub(crate) async fn admin_dashboard(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
     let current = match current_profile_from_headers(&state.pool, &headers).await {
         Ok(profile) => profile,
@@ -370,22 +373,92 @@ pub(crate) async fn admin_dashboard(
     if rows.is_empty() {
         rows.push_str("<tr><td colspan=\"4\">No profiles yet.</td></tr>");
     }
+    let notice = params
+        .get("notice")
+        .filter(|value| !value.is_empty())
+        .map(|value| format!("<p class=\"notice\">{}</p>", html_escape(value)))
+        .unwrap_or_default();
+    let error = params
+        .get("error")
+        .filter(|value| !value.is_empty())
+        .map(|value| format!("<p class=\"error\">{}</p>", html_escape(value)))
+        .unwrap_or_default();
 
     Html(format!(
         "<!doctype html><meta charset=\"utf-8\"><title>Vapor Identity Admin</title>\
          <style>body{{max-width:1100px;margin:3rem auto;padding:0 1.5rem;font:16px/1.5 system-ui,sans-serif}}\
          table{{border-collapse:collapse;width:100%}}td,th{{border:1px solid #ccc;padding:.4rem;text-align:left}}\
-         code{{background:#f4f4f4;padding:.1rem .25rem;border-radius:.2rem}}</style>\
+         code{{background:#f4f4f4;padding:.1rem .25rem;border-radius:.2rem}}\
+         label{{display:block;margin:.6rem 0}}input,select{{font:inherit;padding:.3rem;min-width:20rem}}\
+         button{{font:inherit;padding:.4rem .7rem}}.notice{{background:#e7f6e7;padding:.6rem;border-left:4px solid #2d7a2d}}\
+         .error{{background:#fdeaea;padding:.6rem;border-left:4px solid #b42318}}</style>\
          <h1>Vapor Identity Admin</h1>\
          <p>Signed in as Steam profile <code>{}</code>. Root role is active.</p>\
          <p><a href=\"/login\">Identity</a> · <a href=\"/logout\">Logout</a></p>\
+         {notice}{error}\
          <h2>Readiness</h2>\
          <ul><li>Steam browser login: <code>true</code></li>\
          <li>GitHub browser login configured: <code>{}</code></li>\
          <li>Dashboard session TTL: <code>{DASHBOARD_SESSION_TTL_SECONDS}s</code></li></ul>\
+         <h2>Grant role</h2>\
+         <form method=\"post\" action=\"/admin/roles/grant\">\
+         <label>Role <select name=\"role\"><option value=\"content-developer\">content-developer</option><option value=\"root\">root</option></select></label>\
+         <label>SteamID64 <input name=\"steam_id64\" inputmode=\"numeric\" pattern=\"[0-9]{{17}}\" required></label>\
+         <label>GitHub login <input name=\"github_login\" required></label>\
+         <button type=\"submit\">Grant role</button></form>\
+         <p>This form requires your root dashboard session. It still refuses grants unless the SteamID64 and GitHub login are already linked to the same profile.</p>\
          <h2>Profiles</h2><table><thead><tr><th>Name</th><th>Steam</th><th>GitHub</th><th>Roles</th></tr></thead><tbody>{rows}</tbody></table>",
         html_escape(current.steam_id64.as_deref().unwrap_or("unknown")),
         github_browser_ready(&state.config)
     ))
     .into_response()
+}
+
+pub(crate) async fn admin_grant_role_form(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(request): Form<GrantRoleRequest>,
+) -> Response {
+    let current = match current_profile_from_headers(&state.pool, &headers).await {
+        Ok(Some(current)) => current,
+        Ok(None) => {
+            return text_response(
+                StatusCode::UNAUTHORIZED,
+                "identity: sign in with a root profile before granting roles",
+            );
+        }
+        Err(error) => {
+            return text_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("identity: failed to validate dashboard session: {error}"),
+            );
+        }
+    };
+    if !current.root_authorized {
+        return text_response(
+            StatusCode::FORBIDDEN,
+            "identity: root role is required to grant roles",
+        );
+    }
+
+    match grant_role_request(&state, &request, Some(&current.profile_id)).await {
+        Ok(response) => {
+            let action = if response.granted {
+                "granted"
+            } else {
+                "already active"
+            };
+            redirect_response(&format!(
+                "/admin?notice={}",
+                percent_encode(&format!(
+                    "{} {} for SteamID64 {} / GitHub {}",
+                    action, response.role, response.steam_id64, response.github_login
+                ))
+            ))
+        }
+        Err(error) => redirect_response(&format!(
+            "/admin?error={}",
+            percent_encode(&format!("role grant failed: {}", error.message))
+        )),
+    }
 }

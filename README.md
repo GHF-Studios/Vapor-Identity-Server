@@ -76,6 +76,7 @@ GET  /login/github
 GET  /login/github/callback
 GET  /logout
 GET  /admin
+POST /admin/roles/grant
 ```
 
 Protected routes expect:
@@ -120,6 +121,10 @@ credential and is not accepted as authority for developer/root role grants.
 Root/admin capability also implies content-developer capability in
 authorization policy. Effective role responses include `content-developer` for
 root profiles even when only the `root` row is stored.
+
+`POST /admin/roles/grant` is the browser form wrapper for the same grant logic.
+It requires a non-expired root dashboard session and is intended to replace
+server-local token handling for normal admin role management after bootstrap.
 
 ## Auth configuration
 

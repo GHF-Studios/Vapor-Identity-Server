@@ -96,6 +96,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/logout", get(logout))
         .route("/admin", get(admin_dashboard))
         .route("/admin/", get(admin_dashboard))
+        .route("/admin/roles/grant", post(admin_grant_role_form))
         .layer(DefaultBodyLimit::max(MAX_AUTH_BODY_BYTES))
         .with_state(state);
 
