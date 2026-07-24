@@ -360,8 +360,7 @@ pub(crate) async fn admin_dashboard(
     let mut rows = String::new();
     for row in profile_rows {
         rows.push_str(&format!(
-            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
-            html_escape(&row.profile_id),
+            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
             html_escape(row.display_name.as_deref().unwrap_or("")),
             html_escape(row.steam_ids.as_deref().unwrap_or("")),
             html_escape(row.github_logins.as_deref().unwrap_or("")),
@@ -369,7 +368,7 @@ pub(crate) async fn admin_dashboard(
         ));
     }
     if rows.is_empty() {
-        rows.push_str("<tr><td colspan=\"5\">No profiles yet.</td></tr>");
+        rows.push_str("<tr><td colspan=\"4\">No profiles yet.</td></tr>");
     }
 
     Html(format!(
@@ -384,8 +383,8 @@ pub(crate) async fn admin_dashboard(
          <ul><li>Steam browser login: <code>true</code></li>\
          <li>GitHub browser login configured: <code>{}</code></li>\
          <li>Dashboard session TTL: <code>{DASHBOARD_SESSION_TTL_SECONDS}s</code></li></ul>\
-         <h2>Profiles</h2><table><thead><tr><th>Profile</th><th>Name</th><th>Steam</th><th>GitHub</th><th>Roles</th></tr></thead><tbody>{rows}</tbody></table>",
-        html_escape(&current.profile_id),
+         <h2>Profiles</h2><table><thead><tr><th>Name</th><th>Steam</th><th>GitHub</th><th>Roles</th></tr></thead><tbody>{rows}</tbody></table>",
+        html_escape(current.steam_id64.as_deref().unwrap_or("unknown")),
         github_browser_ready(&state.config)
     ))
     .into_response()

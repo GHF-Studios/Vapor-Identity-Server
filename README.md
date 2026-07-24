@@ -66,7 +66,6 @@ POST /v1/auth/session/finish
 POST /v1/auth/steam/ticket
 POST /v1/auth/github/token
 GET  /v1/admin/profiles
-POST /v1/admin/root/grant
 POST /v1/admin/roles/grant
 POST /v1/init
 GET  /v1/export
@@ -105,21 +104,21 @@ Dashboard sessions currently expire after 300 seconds.
 It can initialize the database and grant/bootstrap the first root role, but it
 is not the normal dashboard login model.
 
-`POST /v1/admin/root/grant` is the compatibility bootstrap route and grants
-`root` by `profile_id`. `POST /v1/admin/roles/grant` is the general
-server-local operator route. It grants `root` or `content-developer` by exactly
-one selector:
+`POST /v1/admin/roles/grant` is the server-local operator route for elevated
+role grants. It grants `root` or `content-developer` only when the request
+provides both external identities for the same already-linked profile:
 
 ```json
-{"role":"root","profile_id":"profile-..."}
-{"role":"root","steam_id64":"7656119..."}
-{"role":"content-developer","github_login":"example"}
+{"role":"root","steam_id64":"7656119...","github_login":"example"}
+{"role":"content-developer","steam_id64":"7656119...","github_login":"example"}
 ```
 
-The server rejects elevated role grants unless the target profile already has
-both linked identities. Root/admin capability also implies content-developer
-capability in authorization policy. Effective role responses include
-`content-developer` for root profiles even when only the `root` row is stored.
+The server keeps an internal profile row to join Steam identity, GitHub
+identity, sessions, roles, and audit events. That internal id is not a login
+credential and is not accepted as authority for developer/root role grants.
+Root/admin capability also implies content-developer capability in
+authorization policy. Effective role responses include `content-developer` for
+root profiles even when only the `root` row is stored.
 
 ## Auth configuration
 

@@ -235,33 +235,21 @@ pub(crate) async fn profile_by_id(
     }))
 }
 
-pub(crate) async fn profile_id_by_steam_id64(
+pub(crate) async fn profile_id_by_linked_identities(
     pool: &SqlitePool,
     steam_id64: &str,
-) -> Result<Option<String>, sqlx::Error> {
-    sqlx::query_scalar::<_, String>(
-        "SELECT p.id
-         FROM profiles p
-         JOIN steam_accounts s ON s.profile_id = p.id
-         WHERE s.steam_id64 = ?
-           AND p.disabled_at_unix IS NULL",
-    )
-    .bind(steam_id64)
-    .fetch_optional(pool)
-    .await
-}
-
-pub(crate) async fn profile_id_by_github_login(
-    pool: &SqlitePool,
     github_login: &str,
 ) -> Result<Option<String>, sqlx::Error> {
     sqlx::query_scalar::<_, String>(
         "SELECT p.id
          FROM profiles p
+         JOIN steam_accounts s ON s.profile_id = p.id
          JOIN github_accounts g ON g.profile_id = p.id
-         WHERE lower(g.github_login) = lower(?)
+         WHERE s.steam_id64 = ?
+           AND lower(g.github_login) = lower(?)
            AND p.disabled_at_unix IS NULL",
     )
+    .bind(steam_id64)
     .bind(github_login)
     .fetch_optional(pool)
     .await

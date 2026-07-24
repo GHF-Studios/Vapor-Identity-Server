@@ -109,29 +109,17 @@ pub(crate) struct FinishAuthAttemptResponse {
 }
 
 #[derive(Deserialize)]
-pub(crate) struct GrantRootRequest {
-    pub(crate) profile_id: String,
-}
-
-#[derive(Serialize)]
-pub(crate) struct GrantRootResponse {
-    pub(crate) profile_id: String,
-    pub(crate) role: &'static str,
-    pub(crate) granted: bool,
-}
-
-#[derive(Deserialize)]
 pub(crate) struct GrantRoleRequest {
     pub(crate) role: String,
-    pub(crate) profile_id: Option<String>,
-    pub(crate) steam_id64: Option<String>,
-    pub(crate) github_login: Option<String>,
+    pub(crate) steam_id64: String,
+    pub(crate) github_login: String,
 }
 
 #[derive(Serialize)]
 pub(crate) struct GrantRoleResponse {
-    pub(crate) profile_id: String,
     pub(crate) role: String,
+    pub(crate) steam_id64: String,
+    pub(crate) github_login: String,
     pub(crate) granted: bool,
 }
 

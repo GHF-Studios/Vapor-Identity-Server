@@ -98,7 +98,7 @@ pub(crate) fn login_html(config: &AuthConfig, current: Option<&CurrentProfile>) 
              <dt>Roles</dt><dd>{}</dd></dl>\
              {github_action}\
              <p><a href=\"/admin\">Open admin dashboard</a> · <a href=\"/logout\">Logout</a></p>",
-            html_escape(&profile.profile_id),
+            html_escape(profile.steam_id64.as_deref().unwrap_or("unknown")),
             html_escape(profile.display_name.as_deref().unwrap_or("")),
             html_escape(profile.steam_id64.as_deref().unwrap_or("")),
             html_escape(github),
@@ -133,7 +133,7 @@ pub(crate) fn admin_locked_html(current: Option<&CurrentProfile>) -> String {
             "<p>You are signed in as Steam profile <code>{}</code>, but this profile is not authorized for root/admin access.</p>\
              <dl><dt>SteamID64</dt><dd>{}</dd><dt>GitHub</dt><dd>{}</dd><dt>Roles</dt><dd>{}</dd></dl>\
              <p><a href=\"/login\">Manage identity</a> · <a href=\"/logout\">Logout</a></p>",
-            html_escape(&profile.profile_id),
+            html_escape(profile.steam_id64.as_deref().unwrap_or("unknown")),
             html_escape(profile.steam_id64.as_deref().unwrap_or("")),
             html_escape(profile.github_login.as_deref().unwrap_or("not linked")),
             html_escape(&display_roles(profile)),
@@ -255,14 +255,6 @@ pub(crate) fn csv_values(value: &str) -> Vec<String> {
             }
         })
         .collect()
-}
-
-pub(crate) fn valid_profile_id(value: &str) -> bool {
-    value.starts_with("profile-")
-        && value.len() <= 80
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
 }
 
 pub(crate) fn valid_auth_attempt_id(value: &str) -> bool {
