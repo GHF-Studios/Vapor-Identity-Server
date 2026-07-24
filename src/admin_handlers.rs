@@ -5,7 +5,7 @@ use axum::Json;
 
 use crate::persistence::*;
 use crate::types::*;
-use crate::util::{authorized, text_response, valid_github_login, valid_steam_id64};
+use crate::util::{text_response, valid_github_login, valid_steam_id64};
 
 pub(crate) async fn list_profiles(
     State(state): State<AppState>,
@@ -44,8 +44,20 @@ pub(crate) async fn grant_profile_role(
     headers: HeaderMap,
     Json(request): Json<GrantRoleRequest>,
 ) -> Response {
-    if !authorized(&headers, &state.admin_token) {
-        return text_response(StatusCode::UNAUTHORIZED, "missing or invalid admin token");
+    match admin_or_root_authorized(&state, &headers).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return text_response(
+                StatusCode::UNAUTHORIZED,
+                "missing or invalid admin token/root session",
+            );
+        }
+        Err(error) => {
+            return text_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("identity: failed to validate authorization: {error}"),
+            );
+        }
     }
 
     let role = request.role.trim();

@@ -104,9 +104,10 @@ Dashboard sessions currently expire after 300 seconds.
 It can initialize the database and grant/bootstrap the first root role, but it
 is not the normal dashboard login model.
 
-`POST /v1/admin/roles/grant` is the server-local operator route for elevated
-role grants. It grants `root` or `content-developer` only when the request
-provides both external identities for the same already-linked profile:
+`POST /v1/admin/roles/grant` is the elevated role-grant route. It requires
+either the server-local bootstrap/admin token or a non-expired root dashboard
+session. It grants `root` or `content-developer` only when the request provides
+both external identities for the same already-linked profile:
 
 ```json
 {"role":"root","steam_id64":"7656119...","github_login":"example"}
