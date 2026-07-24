@@ -1,14 +1,12 @@
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
-use axum::response::{IntoResponse, Response};
+use axum::response::IntoResponse;
 use axum::Json;
 
 use crate::config::DASHBOARD_SESSION_TTL_SECONDS;
 use crate::persistence::*;
 use crate::types::*;
-use crate::util::{
-    authorized, dashboard_identity_ready, github_browser_ready, text_response, valid_profile_id,
-};
+use crate::util::{authorized, dashboard_identity_ready, github_browser_ready};
 pub(crate) async fn healthz() -> &'static str {
     "ok\n"
 }
@@ -127,82 +125,4 @@ pub(crate) async fn export_identity(
         }
     };
     (StatusCode::OK, body)
-}
-
-pub(crate) async fn list_profiles(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
-    match admin_or_root_authorized(&state, &headers).await {
-        Ok(true) => {}
-        Ok(false) => {
-            return (
-                StatusCode::UNAUTHORIZED,
-                "missing or invalid admin token/root session\n".to_string(),
-            );
-        }
-        Err(error) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("identity: failed to validate authorization: {error}\n"),
-            );
-        }
-    }
-
-    let body = match profile_listing(&state.pool).await {
-        Ok(body) => body,
-        Err(error) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("identity: failed to list profiles: {error}\n"),
-            );
-        }
-    };
-    (StatusCode::OK, body)
-}
-
-pub(crate) async fn grant_root_role(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Json(request): Json<GrantRootRequest>,
-) -> Response {
-    if !authorized(&headers, &state.admin_token) {
-        return text_response(StatusCode::UNAUTHORIZED, "missing or invalid admin token");
-    }
-    if !valid_profile_id(&request.profile_id) {
-        return text_response(StatusCode::BAD_REQUEST, "identity: invalid profile id");
-    }
-    match profile_has_dual_identity(&state.pool, &request.profile_id).await {
-        Ok(true) => {}
-        Ok(false) => {
-            return text_response(
-                StatusCode::BAD_REQUEST,
-                "identity: root role requires linked Steam and GitHub identities",
-            );
-        }
-        Err(error) => {
-            return text_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                &format!("identity: failed to validate profile identity state: {error}"),
-            );
-        }
-    }
-    let granted = match grant_root(&state.pool, &request.profile_id, None).await {
-        Ok(granted) => granted,
-        Err(error) => {
-            return text_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                &format!("identity: failed to grant root role: {error}"),
-            );
-        }
-    };
-    (
-        StatusCode::OK,
-        Json(GrantRootResponse {
-            profile_id: request.profile_id,
-            role: "root",
-            granted,
-        }),
-    )
-        .into_response()
 }

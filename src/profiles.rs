@@ -31,15 +31,24 @@ pub(crate) async fn profile_has_root_role(
     pool: &SqlitePool,
     profile_id: &str,
 ) -> Result<bool, sqlx::Error> {
+    profile_has_role(pool, profile_id, "root").await
+}
+
+pub(crate) async fn profile_has_role(
+    pool: &SqlitePool,
+    profile_id: &str,
+    role: &str,
+) -> Result<bool, sqlx::Error> {
     let exists = sqlx::query_scalar::<_, i64>(
         "SELECT EXISTS (
             SELECT 1 FROM profile_roles
             WHERE profile_id = ?
-              AND role = 'root'
+              AND role = ?
               AND revoked_at_unix IS NULL
         )",
     )
     .bind(profile_id)
+    .bind(role)
     .fetch_one(pool)
     .await?;
     Ok(exists == 1)
@@ -60,27 +69,53 @@ pub(crate) async fn grant_root(
     profile_id: &str,
     actor_profile_id: Option<&str>,
 ) -> Result<bool, sqlx::Error> {
+    grant_role(pool, profile_id, "root", actor_profile_id).await
+}
+
+pub(crate) fn valid_elevated_role(role: &str) -> bool {
+    matches!(role, "root" | "content-developer")
+}
+
+pub(crate) async fn grant_role(
+    pool: &SqlitePool,
+    profile_id: &str,
+    role: &str,
+    actor_profile_id: Option<&str>,
+) -> Result<bool, sqlx::Error> {
     let now = unix_now_i64();
-    let already_active = profile_has_root_role(pool, profile_id).await?;
+    let already_active = profile_has_role(pool, profile_id, role).await?;
     let mut tx = pool.begin().await?;
     sqlx::query(
         "INSERT INTO profile_roles (profile_id, role, granted_at_unix, revoked_at_unix)
-         VALUES (?, 'root', ?, NULL)
+         VALUES (?, ?, ?, NULL)
          ON CONFLICT(profile_id, role) DO UPDATE
          SET granted_at_unix = excluded.granted_at_unix,
              revoked_at_unix = NULL",
     )
     .bind(profile_id)
+    .bind(role)
     .bind(now)
     .execute(&mut *tx)
     .await?;
+    let event_type = if role == "root" {
+        "root_role_granted"
+    } else {
+        "profile_role_granted"
+    };
+    let detail = if role == "root" {
+        String::new()
+    } else {
+        format!("role={role}")
+    };
     sqlx::query(
         "INSERT INTO audit_events (event_type, actor_profile_id, subject_profile_id, created_at_unix, detail)
-         VALUES ('root_role_granted', ?, ?, ?, '')",
+         VALUES (?, ?, ?, ?, ?)",
     )
+    .bind(event_type)
     .bind(actor_profile_id)
     .bind(profile_id)
     .bind(now)
+    .bind(detail)
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
@@ -186,6 +221,7 @@ pub(crate) async fn profile_by_id(
         .as_deref()
         .map(csv_values)
         .unwrap_or_default();
+    let roles = effective_roles(roles);
     let root_authorized =
         roles.iter().any(|role| role == "root") && steam_id64.is_some() && github_login.is_some();
 
@@ -197,6 +233,38 @@ pub(crate) async fn profile_by_id(
         roles,
         root_authorized,
     }))
+}
+
+pub(crate) async fn profile_id_by_steam_id64(
+    pool: &SqlitePool,
+    steam_id64: &str,
+) -> Result<Option<String>, sqlx::Error> {
+    sqlx::query_scalar::<_, String>(
+        "SELECT p.id
+         FROM profiles p
+         JOIN steam_accounts s ON s.profile_id = p.id
+         WHERE s.steam_id64 = ?
+           AND p.disabled_at_unix IS NULL",
+    )
+    .bind(steam_id64)
+    .fetch_optional(pool)
+    .await
+}
+
+pub(crate) async fn profile_id_by_github_login(
+    pool: &SqlitePool,
+    github_login: &str,
+) -> Result<Option<String>, sqlx::Error> {
+    sqlx::query_scalar::<_, String>(
+        "SELECT p.id
+         FROM profiles p
+         JOIN github_accounts g ON g.profile_id = p.id
+         WHERE lower(g.github_login) = lower(?)
+           AND p.disabled_at_unix IS NULL",
+    )
+    .bind(github_login)
+    .fetch_optional(pool)
+    .await
 }
 
 pub(crate) async fn revoke_identity_session(
@@ -269,7 +337,16 @@ pub(crate) async fn active_roles(
     .bind(profile_id)
     .fetch_all(pool)
     .await?;
-    Ok(rows)
+    Ok(effective_roles(rows))
+}
+
+pub(crate) fn effective_roles(mut roles: Vec<String>) -> Vec<String> {
+    if roles.iter().any(|role| role == "root") {
+        roles.push("content-developer".to_string());
+    }
+    roles.sort();
+    roles.dedup();
+    roles
 }
 
 pub(crate) async fn link_steam_account(

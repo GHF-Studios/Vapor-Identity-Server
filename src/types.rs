@@ -121,6 +121,21 @@ pub(crate) struct GrantRootResponse {
 }
 
 #[derive(Deserialize)]
+pub(crate) struct GrantRoleRequest {
+    pub(crate) role: String,
+    pub(crate) profile_id: Option<String>,
+    pub(crate) steam_id64: Option<String>,
+    pub(crate) github_login: Option<String>,
+}
+
+#[derive(Serialize)]
+pub(crate) struct GrantRoleResponse {
+    pub(crate) profile_id: String,
+    pub(crate) role: String,
+    pub(crate) granted: bool,
+}
+
+#[derive(Deserialize)]
 pub(crate) struct GitHubUser {
     pub(crate) id: i64,
     pub(crate) login: String,

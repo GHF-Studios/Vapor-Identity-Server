@@ -67,6 +67,7 @@ POST /v1/auth/steam/ticket
 POST /v1/auth/github/token
 GET  /v1/admin/profiles
 POST /v1/admin/root/grant
+POST /v1/admin/roles/grant
 POST /v1/init
 GET  /v1/export
 GET  /login
@@ -103,6 +104,22 @@ Dashboard sessions currently expire after 300 seconds.
 `VAPOR_IDENTITY_ADMIN_TOKEN` remains a server-local operations/bootstrap token.
 It can initialize the database and grant/bootstrap the first root role, but it
 is not the normal dashboard login model.
+
+`POST /v1/admin/root/grant` is the compatibility bootstrap route and grants
+`root` by `profile_id`. `POST /v1/admin/roles/grant` is the general
+server-local operator route. It grants `root` or `content-developer` by exactly
+one selector:
+
+```json
+{"role":"root","profile_id":"profile-..."}
+{"role":"root","steam_id64":"7656119..."}
+{"role":"content-developer","github_login":"example"}
+```
+
+The server rejects elevated role grants unless the target profile already has
+both linked identities. Root/admin capability also implies content-developer
+capability in authorization policy. Effective role responses include
+`content-developer` for root profiles even when only the `root` row is stored.
 
 ## Auth configuration
 
@@ -171,7 +188,8 @@ verifies GitHub identity but does not create a GitHub-only profile.
 src/main.rs               router/bootstrap only
 src/config.rs             environment-backed config and shared constants
 src/types.rs              request/response DTOs and app state
-src/status_handlers.rs    health/status/init/export/admin role routes
+src/status_handlers.rs    health/status/init/export routes
+src/admin_handlers.rs     admin profile listing and role-grant routes
 src/session_handlers.rs   API auth-attempt and short session flow
 src/provider_handlers.rs  direct Steam/GitHub verification probes
 src/browser_handlers.rs   /login, /logout, /admin browser routes

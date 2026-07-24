@@ -1,3 +1,4 @@
+mod admin_handlers;
 mod api_handlers;
 mod auth_attempts;
 mod browser_handlers;
@@ -84,6 +85,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/auth/github/token", post(auth_github_token))
         .route("/v1/admin/profiles", get(list_profiles))
         .route("/v1/admin/root/grant", post(grant_root_role))
+        .route("/v1/admin/roles/grant", post(grant_profile_role))
         .route("/v1/init", post(init))
         .route("/v1/export", get(export_identity))
         .route("/login", get(login_page))

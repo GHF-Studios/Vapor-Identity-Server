@@ -281,6 +281,21 @@ pub(crate) fn valid_browser_state(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
 }
 
+pub(crate) fn valid_steam_id64(value: &str) -> bool {
+    value.len() == 17 && value.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+pub(crate) fn valid_github_login(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 39
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        && !value.starts_with('-')
+        && !value.ends_with('-')
+        && !value.contains("--")
+}
+
 pub(crate) fn valid_hex_ticket(ticket: &str) -> bool {
     !ticket.is_empty()
         && ticket.len() <= 8192
