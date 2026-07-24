@@ -84,7 +84,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/auth/steam/ticket", post(auth_steam_ticket))
         .route("/v1/auth/github/token", post(auth_github_token))
         .route("/v1/admin/profiles", get(list_profiles))
+        .route("/v1/admin/audit", get(list_audit_events))
         .route("/v1/admin/roles/grant", post(grant_profile_role))
+        .route("/v1/admin/roles/revoke", post(revoke_profile_role))
         .route("/v1/init", post(init))
         .route("/v1/export", get(export_identity))
         .route("/login", get(login_page))
@@ -97,6 +99,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/admin", get(admin_dashboard))
         .route("/admin/", get(admin_dashboard))
         .route("/admin/roles/grant", post(admin_grant_role_form))
+        .route("/admin/roles/revoke", post(admin_revoke_role_form))
         .layer(DefaultBodyLimit::max(MAX_AUTH_BODY_BYTES))
         .with_state(state);
 

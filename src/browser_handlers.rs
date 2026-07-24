@@ -5,7 +5,7 @@ use axum::response::{Html, IntoResponse, Response};
 use axum::Form;
 use std::collections::HashMap;
 
-use crate::admin_handlers::grant_role_request;
+use crate::admin_handlers::{grant_role_request, revoke_role_request};
 use crate::config::{
     BROWSER_LOGIN_ATTEMPT_TTL_SECONDS, DASHBOARD_SESSION_TTL_SECONDS, STEAM_OPENID_ENDPOINT,
 };
@@ -360,10 +360,21 @@ pub(crate) async fn admin_dashboard(
                 .into_response();
         }
     };
+    let audit_rows = match recent_audit_events(&state.pool, 25).await {
+        Ok(rows) => rows,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("identity: failed to load dashboard audit events: {error}\n"),
+            )
+                .into_response();
+        }
+    };
     let mut rows = String::new();
     for row in profile_rows {
+        let actions = role_action_forms(&row);
         rows.push_str(&format!(
-            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{actions}</td></tr>",
             html_escape(row.display_name.as_deref().unwrap_or("")),
             html_escape(row.steam_ids.as_deref().unwrap_or("")),
             html_escape(row.github_logins.as_deref().unwrap_or("")),
@@ -371,7 +382,28 @@ pub(crate) async fn admin_dashboard(
         ));
     }
     if rows.is_empty() {
-        rows.push_str("<tr><td colspan=\"4\">No profiles yet.</td></tr>");
+        rows.push_str("<tr><td colspan=\"5\">No profiles yet.</td></tr>");
+    }
+    let mut audit = String::new();
+    for row in audit_rows {
+        audit.push_str(&format!(
+            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+            row.event_id,
+            row.created_at_unix,
+            html_escape(&row.event_type),
+            html_escape(&external_identity_label(
+                row.actor_steam_ids.as_deref(),
+                row.actor_github_logins.as_deref()
+            )),
+            html_escape(&external_identity_label(
+                row.subject_steam_ids.as_deref(),
+                row.subject_github_logins.as_deref()
+            )),
+            html_escape(&row.detail)
+        ));
+    }
+    if audit.is_empty() {
+        audit.push_str("<tr><td colspan=\"6\">No audit events yet.</td></tr>");
     }
     let notice = params
         .get("notice")
@@ -390,7 +422,8 @@ pub(crate) async fn admin_dashboard(
          table{{border-collapse:collapse;width:100%}}td,th{{border:1px solid #ccc;padding:.4rem;text-align:left}}\
          code{{background:#f4f4f4;padding:.1rem .25rem;border-radius:.2rem}}\
          label{{display:block;margin:.6rem 0}}input,select{{font:inherit;padding:.3rem;min-width:20rem}}\
-         button{{font:inherit;padding:.4rem .7rem}}.notice{{background:#e7f6e7;padding:.6rem;border-left:4px solid #2d7a2d}}\
+         button{{font:inherit;padding:.4rem .7rem}}form.inline{{display:inline}}form.inline button{{padding:.2rem .45rem;margin:.1rem}}\
+         .notice{{background:#e7f6e7;padding:.6rem;border-left:4px solid #2d7a2d}}\
          .error{{background:#fdeaea;padding:.6rem;border-left:4px solid #b42318}}</style>\
          <h1>Vapor Identity Admin</h1>\
          <p>Signed in as Steam profile <code>{}</code>. Root role is active.</p>\
@@ -407,7 +440,9 @@ pub(crate) async fn admin_dashboard(
          <label>GitHub login <input name=\"github_login\" required></label>\
          <button type=\"submit\">Grant role</button></form>\
          <p>This form requires your root dashboard session. It still refuses grants unless the SteamID64 and GitHub login are already linked to the same profile.</p>\
-         <h2>Profiles</h2><table><thead><tr><th>Name</th><th>Steam</th><th>GitHub</th><th>Roles</th></tr></thead><tbody>{rows}</tbody></table>",
+         <p>Root implies content-developer. To demote a root profile to developer, first grant <code>content-developer</code>, then revoke <code>root</code>.</p>\
+         <h2>Profiles</h2><table><thead><tr><th>Name</th><th>Steam</th><th>GitHub</th><th>Effective roles</th><th>Actions</th></tr></thead><tbody>{rows}</tbody></table>\
+         <h2>Recent audit events</h2><table><thead><tr><th>ID</th><th>Unix time</th><th>Event</th><th>Actor</th><th>Subject</th><th>Detail</th></tr></thead><tbody>{audit}</tbody></table>",
         html_escape(current.steam_id64.as_deref().unwrap_or("unknown")),
         github_browser_ready(&state.config)
     ))
@@ -460,5 +495,103 @@ pub(crate) async fn admin_grant_role_form(
             "/admin?error={}",
             percent_encode(&format!("role grant failed: {}", error.message))
         )),
+    }
+}
+
+pub(crate) async fn admin_revoke_role_form(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(request): Form<RevokeRoleRequest>,
+) -> Response {
+    let current = match current_profile_from_headers(&state.pool, &headers).await {
+        Ok(Some(current)) => current,
+        Ok(None) => {
+            return text_response(
+                StatusCode::UNAUTHORIZED,
+                "identity: sign in with a root profile before revoking roles",
+            );
+        }
+        Err(error) => {
+            return text_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("identity: failed to validate dashboard session: {error}"),
+            );
+        }
+    };
+    if !current.root_authorized {
+        return text_response(
+            StatusCode::FORBIDDEN,
+            "identity: root role is required to revoke roles",
+        );
+    }
+
+    match revoke_role_request(&state, &request, Some(&current.profile_id)).await {
+        Ok(response) => {
+            let action = if response.revoked {
+                "revoked"
+            } else {
+                "was not active"
+            };
+            redirect_response(&format!(
+                "/admin?notice={}",
+                percent_encode(&format!(
+                    "{} {} for SteamID64 {} / GitHub {}",
+                    action, response.role, response.steam_id64, response.github_login
+                ))
+            ))
+        }
+        Err(error) => redirect_response(&format!(
+            "/admin?error={}",
+            percent_encode(&format!("role revoke failed: {}", error.message))
+        )),
+    }
+}
+
+fn role_action_forms(row: &ProfileRow) -> String {
+    let Some(steam_id64) = row
+        .steam_ids
+        .as_deref()
+        .and_then(|value| value.split(',').find(|part| !part.trim().is_empty()))
+        .map(str::trim)
+    else {
+        return "no linked Steam identity".to_string();
+    };
+    let Some(github_login) = row
+        .github_logins
+        .as_deref()
+        .and_then(|value| value.split(',').find(|part| !part.trim().is_empty()))
+        .map(str::trim)
+    else {
+        return "no linked GitHub identity".to_string();
+    };
+    if row.stored_roles.is_empty() {
+        return "no active stored role".to_string();
+    }
+
+    let mut forms = String::new();
+    for role in &row.stored_roles {
+        forms.push_str(&format!(
+            "<form class=\"inline\" method=\"post\" action=\"/admin/roles/revoke\">\
+             <input type=\"hidden\" name=\"role\" value=\"{}\">\
+             <input type=\"hidden\" name=\"steam_id64\" value=\"{}\">\
+             <input type=\"hidden\" name=\"github_login\" value=\"{}\">\
+             <button type=\"submit\">Revoke {}</button></form>",
+            html_escape(role),
+            html_escape(steam_id64),
+            html_escape(github_login),
+            html_escape(role),
+        ));
+    }
+    forms
+}
+
+fn external_identity_label(steam_ids: Option<&str>, github_logins: Option<&str>) -> String {
+    let steam = steam_ids.unwrap_or("").trim();
+    let github = github_logins.unwrap_or("").trim();
+    match (steam.is_empty(), github.is_empty()) {
+        (true, true) => "server-local".to_string(),
+        (false, true) => format!("Steam {steam}"),
+        (true, false) => format!("GitHub {github}"),
+        (false, false) => format!("Steam {steam} / GitHub {github}"),
     }
 }

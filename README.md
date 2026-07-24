@@ -66,7 +66,9 @@ POST /v1/auth/session/finish
 POST /v1/auth/steam/ticket
 POST /v1/auth/github/token
 GET  /v1/admin/profiles
+GET  /v1/admin/audit
 POST /v1/admin/roles/grant
+POST /v1/admin/roles/revoke
 POST /v1/init
 GET  /v1/export
 GET  /login
@@ -77,6 +79,7 @@ GET  /login/github/callback
 GET  /logout
 GET  /admin
 POST /admin/roles/grant
+POST /admin/roles/revoke
 ```
 
 Protected routes expect:
@@ -125,6 +128,19 @@ root profiles even when only the `root` row is stored.
 `POST /admin/roles/grant` is the browser form wrapper for the same grant logic.
 It requires a non-expired root dashboard session and is intended to replace
 server-local token handling for normal admin role management after bootstrap.
+
+`POST /v1/admin/roles/revoke` and `POST /admin/roles/revoke` use the same
+authorization and external-identity target model as grants. Revocation requires
+the SteamID64 and GitHub login to resolve to the same linked profile. The
+service refuses to revoke the last active `root` role so a normal dashboard/API
+mistake cannot remove all root access. Because `root` implies
+`content-developer`, revoking `content-developer` from an active root profile is
+rejected; demote root to developer by granting an explicit `content-developer`
+role first and then revoking `root`.
+
+`GET /v1/admin/audit` returns a recent audit event listing for root/admin
+operators. The listing identifies actors and subjects by linked Steam/GitHub
+identities and intentionally does not expose internal profile ids.
 
 ## Auth configuration
 
@@ -194,7 +210,7 @@ src/main.rs               router/bootstrap only
 src/config.rs             environment-backed config and shared constants
 src/types.rs              request/response DTOs and app state
 src/status_handlers.rs    health/status/init/export routes
-src/admin_handlers.rs     admin profile listing and role-grant routes
+src/admin_handlers.rs     admin profile listing, role, and audit routes
 src/session_handlers.rs   API auth-attempt and short session flow
 src/provider_handlers.rs  direct Steam/GitHub verification probes
 src/browser_handlers.rs   /login, /logout, /admin browser routes

@@ -53,6 +53,38 @@ pub(crate) async fn list_profiles(
     (StatusCode::OK, body)
 }
 
+pub(crate) async fn list_audit_events(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    match admin_or_root_authorized(&state, &headers).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                "missing or invalid admin token/root session\n".to_string(),
+            );
+        }
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("identity: failed to validate authorization: {error}\n"),
+            );
+        }
+    }
+
+    let body = match audit_listing(&state.pool).await {
+        Ok(body) => body,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("identity: failed to list audit events: {error}\n"),
+            );
+        }
+    };
+    (StatusCode::OK, body)
+}
+
 pub(crate) async fn grant_profile_role(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -66,6 +98,24 @@ pub(crate) async fn grant_profile_role(
     };
 
     match grant_role_request(&state, &request, actor_profile_id.as_deref()).await {
+        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Err(error) => text_response(error.status, &format!("identity: {}", error.message)),
+    }
+}
+
+pub(crate) async fn revoke_profile_role(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<RevokeRoleRequest>,
+) -> Response {
+    let actor_profile_id = match role_grant_actor(&state, &headers).await {
+        Ok(actor_profile_id) => actor_profile_id,
+        Err(error) => {
+            return text_response(error.status, &format!("identity: {}", error.message));
+        }
+    };
+
+    match revoke_role_request(&state, &request, actor_profile_id.as_deref()).await {
         Ok(response) => (StatusCode::OK, Json(response)).into_response(),
         Err(error) => text_response(error.status, &format!("identity: {}", error.message)),
     }
@@ -168,5 +218,106 @@ pub(crate) async fn grant_role_request(
         steam_id64: steam_id64.to_string(),
         github_login: github_login.to_string(),
         granted,
+    })
+}
+
+pub(crate) async fn revoke_role_request(
+    state: &AppState,
+    request: &RevokeRoleRequest,
+    actor_profile_id: Option<&str>,
+) -> Result<RevokeRoleResponse, RoleGrantError> {
+    let role = request.role.trim();
+    if !valid_elevated_role(role) {
+        return Err(RoleGrantError::new(
+            StatusCode::BAD_REQUEST,
+            "role must be root or content-developer",
+        ));
+    }
+
+    let steam_id64 = request.steam_id64.trim();
+    if !valid_steam_id64(steam_id64) {
+        return Err(RoleGrantError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid SteamID64",
+        ));
+    }
+    let github_login = request.github_login.trim();
+    if !valid_github_login(github_login) {
+        return Err(RoleGrantError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid GitHub login",
+        ));
+    }
+
+    let profile_id =
+        match profile_id_by_linked_identities(&state.pool, steam_id64, github_login).await {
+            Ok(Some(profile_id)) => profile_id,
+            Ok(None) => {
+                return Err(RoleGrantError::new(
+                    StatusCode::NOT_FOUND,
+                    "linked Steam/GitHub developer profile not found",
+                ));
+            }
+            Err(error) => {
+                return Err(RoleGrantError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("failed to resolve linked developer profile: {error}"),
+                ));
+            }
+        };
+    match profile_has_dual_identity(&state.pool, &profile_id).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return Err(RoleGrantError::new(
+                StatusCode::BAD_REQUEST,
+                "elevated roles require linked Steam and GitHub identities",
+            ));
+        }
+        Err(error) => {
+            return Err(RoleGrantError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to validate profile identity state: {error}"),
+            ));
+        }
+    }
+
+    if role == "content-developer" {
+        match profile_has_root_role(&state.pool, &profile_id).await {
+            Ok(true) => {
+                return Err(RoleGrantError::new(
+                    StatusCode::BAD_REQUEST,
+                    "root implies content-developer; revoke root first to remove developer capability",
+                ));
+            }
+            Ok(false) => {}
+            Err(error) => {
+                return Err(RoleGrantError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("failed to validate profile role state: {error}"),
+                ));
+            }
+        }
+    }
+
+    let revoked = match revoke_role(&state.pool, &profile_id, role, actor_profile_id).await {
+        Ok(revoked) => revoked,
+        Err(error) => {
+            let message = error.to_string();
+            let status = if message.contains("last active root") {
+                StatusCode::BAD_REQUEST
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            return Err(RoleGrantError::new(
+                status,
+                format!("failed to revoke profile role: {error}"),
+            ));
+        }
+    };
+    Ok(RevokeRoleResponse {
+        role: role.to_string(),
+        steam_id64: steam_id64.to_string(),
+        github_login: github_login.to_string(),
+        revoked,
     })
 }

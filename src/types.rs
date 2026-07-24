@@ -124,6 +124,21 @@ pub(crate) struct GrantRoleResponse {
 }
 
 #[derive(Deserialize)]
+pub(crate) struct RevokeRoleRequest {
+    pub(crate) role: String,
+    pub(crate) steam_id64: String,
+    pub(crate) github_login: String,
+}
+
+#[derive(Serialize)]
+pub(crate) struct RevokeRoleResponse {
+    pub(crate) role: String,
+    pub(crate) steam_id64: String,
+    pub(crate) github_login: String,
+    pub(crate) revoked: bool,
+}
+
+#[derive(Deserialize)]
 pub(crate) struct GitHubUser {
     pub(crate) id: i64,
     pub(crate) login: String,
