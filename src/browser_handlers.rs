@@ -1,13 +1,31 @@
-use axum::extract::{Query, State};
+use axum::body::to_bytes;
+use axum::extract::{Path, Query, State};
 use axum::http::header::{CACHE_CONTROL, LOCATION, SET_COOKIE};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::Form;
+use axum::Json;
+use serde::Deserialize;
+use sqlx::Row;
 use std::collections::HashMap;
 
-use crate::admin_handlers::{grant_role_request, revoke_role_request};
+#[derive(Deserialize)]
+pub(crate) struct AutomationCredentialForm {
+    label: String,
+    expires_in_days: i64,
+    #[serde(default)]
+    scopes: Vec<String>,
+}
+
+use crate::automation_credentials::{
+    create_automation_credential, revoke_automation_credential, CreateAutomationCredentialRequest,
+};
 use crate::config::{
     BROWSER_LOGIN_ATTEMPT_TTL_SECONDS, DASHBOARD_SESSION_TTL_SECONDS, STEAM_OPENID_ENDPOINT,
+};
+use crate::permission_requests::{
+    approve_permission_request, create_permission_request, reject_permission_request,
+    ApprovePermissionRequest, CreatePermissionRequest, RejectPermissionRequest,
 };
 use crate::persistence::*;
 use crate::providers::{exchange_github_web_code, verify_github_access_token, verify_steam_openid};
@@ -367,6 +385,77 @@ pub(crate) async fn admin_dashboard(
             );
         }
     };
+    let request_rows = match sqlx::query(
+        "SELECT id, action, role, steam_id64, github_login, version, created_at_unix, expires_at_unix
+         FROM permission_requests WHERE status = 'pending' ORDER BY created_at_unix LIMIT 200",
+    )
+    .fetch_all(&state.pool)
+    .await
+    {
+        Ok(rows) => rows,
+        Err(_) => return admin_text_response(StatusCode::INTERNAL_SERVER_ERROR, "identity: failed to load permission requests"),
+    };
+    let credential_rows = match sqlx::query(
+        "SELECT id, label, scopes, created_at_unix, expires_at_unix, revoked_at_unix
+         FROM automation_credentials ORDER BY created_at_unix DESC LIMIT 200",
+    )
+    .fetch_all(&state.pool)
+    .await
+    {
+        Ok(rows) => rows,
+        Err(_) => {
+            return admin_text_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "identity: failed to load automation credentials",
+            )
+        }
+    };
+    let mut credentials = String::new();
+    for row in credential_rows {
+        let id: String = row.get("id");
+        let revoked_at: Option<i64> = row.get("revoked_at_unix");
+        let expires_at: i64 = row.get("expires_at_unix");
+        let state_label = if revoked_at.is_some() {
+            "revoked"
+        } else if expires_at <= unix_now_i64() {
+            "expired"
+        } else {
+            "active"
+        };
+        let revoke = if state_label == "active" {
+            format!("<form class=\"inline\" method=\"post\" action=\"/admin/identity/automation-credentials/{}/revoke\"><button type=\"submit\">Revoke</button></form>", html_escape(&id))
+        } else {
+            String::new()
+        };
+        credentials.push_str(&format!(
+            "<tr><td>{}</td><td><code>{}</code></td><td>{}</td><td>{}</td><td>{}</td><td>{revoke}</td></tr>",
+            html_escape(row.get::<String, _>("label").as_str()),
+            html_escape(row.get::<String, _>("scopes").as_str()),
+            row.get::<i64, _>("created_at_unix"), expires_at, state_label
+        ));
+    }
+    if credentials.is_empty() {
+        credentials.push_str("<tr><td colspan=\"6\">No automation credentials.</td></tr>");
+    }
+    let mut permission_requests = String::new();
+    for row in request_rows {
+        let id: String = row.get("id");
+        let version: i64 = row.get("version");
+        permission_requests.push_str(&format!(
+            "<tr><td><code>{}</code></td><td>{}</td><td>{}</td><td>Steam {} / GitHub {}</td><td>{}</td><td>{}</td><td><form class=\"inline\" method=\"post\" action=\"/admin/identity/permission-requests/{}/approve\"><input type=\"hidden\" name=\"expected_version\" value=\"{}\"><label><input type=\"checkbox\" name=\"confirmed\" value=\"true\" required> confirm</label><button type=\"submit\">Approve</button></form><form class=\"inline\" method=\"post\" action=\"/admin/identity/permission-requests/{}/reject\"><input type=\"hidden\" name=\"expected_version\" value=\"{}\"><input type=\"hidden\" name=\"reason\" value=\"Rejected by root administrator\"><label><input type=\"checkbox\" name=\"confirmed\" value=\"true\" required> confirm</label><button type=\"submit\">Reject</button></form></td></tr>",
+            html_escape(&id),
+            html_escape(row.get::<String, _>("action").as_str()),
+            html_escape(row.get::<String, _>("role").as_str()),
+            html_escape(row.get::<String, _>("steam_id64").as_str()),
+            html_escape(row.get::<String, _>("github_login").as_str()),
+            row.get::<i64, _>("created_at_unix"),
+            row.get::<i64, _>("expires_at_unix"),
+            html_escape(&id), version, html_escape(&id), version
+        ));
+    }
+    if permission_requests.is_empty() {
+        permission_requests.push_str("<tr><td colspan=\"7\">No pending requests.</td></tr>");
+    }
     let mut rows = String::new();
     for row in profile_rows {
         let actions = role_action_forms(&row);
@@ -431,6 +520,8 @@ pub(crate) async fn admin_dashboard(
          <button type=\"submit\">Grant role</button></form>\
          <p>This form requires your root dashboard session. It still refuses grants unless the SteamID64 and GitHub login are already linked to the same profile.</p>\
          <p>Root implies content-developer. To demote a root profile to developer, first grant <code>content-developer</code>, then revoke <code>root</code>.</p>\
+         <h2>Permission requests</h2><p>Role changes remain pending until approved here by a root session.</p><table><thead><tr><th>Request</th><th>Action</th><th>Role</th><th>Subject</th><th>Created</th><th>Expires</th><th>Decision</th></tr></thead><tbody>{permission_requests}</tbody></table>\
+         <h2>Automation request credentials</h2><p>These credentials can submit only the selected request types. Copy the secret from the one-time creation response; it is not stored or shown again.</p><form method=\"post\" action=\"/admin/identity/automation-credentials\"><label>Label <input name=\"label\" maxlength=\"80\" required></label><label>Expires in days <input name=\"expires_in_days\" type=\"number\" min=\"1\" max=\"90\" value=\"30\" required></label><label><input type=\"checkbox\" name=\"scopes\" value=\"platform:deploy-request:create\"> Create Platform deploy requests</label><label><input type=\"checkbox\" name=\"scopes\" value=\"identity:role-request:create\"> Create Identity role requests</label><button type=\"submit\">Create request credential</button></form><table><thead><tr><th>Label</th><th>Scopes</th><th>Created</th><th>Expires</th><th>Status</th><th>Action</th></tr></thead><tbody>{credentials}</tbody></table>\
          <h2>Profiles</h2><table><thead><tr><th>Name</th><th>Steam</th><th>GitHub</th><th>Effective roles</th><th>Actions</th></tr></thead><tbody>{rows}</tbody></table>\
          <h2>Recent audit events</h2><table><thead><tr><th>ID</th><th>Unix time</th><th>Event</th><th>Actor</th><th>Subject</th><th>Detail</th></tr></thead><tbody>{audit}</tbody></table></main></body></html>",
         html_escape(current.steam_id64.as_deref().unwrap_or("unknown")),
@@ -491,26 +582,18 @@ pub(crate) async fn admin_grant_role_form(
         );
     }
 
-    match grant_role_request(&state, &request, Some(&current.profile_id)).await {
-        Ok(response) => {
-            let action = if response.granted {
-                "granted"
-            } else {
-                "already active"
-            };
-            admin_redirect_response(&format!(
-                "/admin/identity?notice={}",
-                percent_encode(&format!(
-                    "{} {} for SteamID64 {} / GitHub {}",
-                    action, response.role, response.steam_id64, response.github_login
-                ))
-            ))
-        }
-        Err(error) => admin_redirect_response(&format!(
-            "/admin/identity?error={}",
-            percent_encode(&format!("role grant failed: {}", error.message))
-        )),
-    }
+    let response = create_permission_request(
+        State(state),
+        headers,
+        Json(CreatePermissionRequest {
+            action: "grant".to_string(),
+            role: request.role,
+            steam_id64: request.steam_id64,
+            github_login: request.github_login,
+        }),
+    )
+    .await;
+    permission_request_form_response(response, "grant").await
 }
 
 pub(crate) async fn admin_revoke_role_form(
@@ -546,26 +629,188 @@ pub(crate) async fn admin_revoke_role_form(
         );
     }
 
-    match revoke_role_request(&state, &request, Some(&current.profile_id)).await {
-        Ok(response) => {
-            let action = if response.revoked {
-                "revoked"
-            } else {
-                "was not active"
-            };
-            admin_redirect_response(&format!(
-                "/admin/identity?notice={}",
-                percent_encode(&format!(
-                    "{} {} for SteamID64 {} / GitHub {}",
-                    action, response.role, response.steam_id64, response.github_login
-                ))
-            ))
+    let response = create_permission_request(
+        State(state),
+        headers,
+        Json(CreatePermissionRequest {
+            action: "revoke".to_string(),
+            role: request.role,
+            steam_id64: request.steam_id64,
+            github_login: request.github_login,
+        }),
+    )
+    .await;
+    permission_request_form_response(response, "revoke").await
+}
+
+async fn permission_request_form_response(response: Response, action: &str) -> Response {
+    let status = response.status();
+    if status == StatusCode::ACCEPTED {
+        let body = match to_bytes(response.into_body(), 4096).await {
+            Ok(body) => body,
+            Err(_) => {
+                return admin_text_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "identity: request was recorded but its receipt could not be read",
+                )
+            }
+        };
+        let id = serde_json::from_slice::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            })
+            .unwrap_or_else(|| "unknown".to_string());
+        return admin_redirect_response(&format!(
+            "/admin/identity?notice={}",
+            percent_encode(&format!("{action} request {id} is pending root approval"))
+        ));
+    }
+    let body = match to_bytes(response.into_body(), 8192).await {
+        Ok(body) => String::from_utf8_lossy(&body).trim().to_string(),
+        Err(_) => "request failed".to_string(),
+    };
+    admin_redirect_response(&format!(
+        "/admin/identity?error={}",
+        percent_encode(&format!("role {action} request failed: {body}"))
+    ))
+}
+
+pub(crate) async fn admin_approve_permission_request_form(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Form(request): Form<ApprovePermissionRequest>,
+) -> Response {
+    if !same_origin_browser_request(&headers, &state.config) {
+        return admin_text_response(
+            StatusCode::FORBIDDEN,
+            "identity: same-origin request required",
+        );
+    }
+    let response = approve_permission_request(State(state), headers, Path(id), Json(request)).await;
+    permission_decision_form_response(response, "approve").await
+}
+
+pub(crate) async fn admin_reject_permission_request_form(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Form(request): Form<RejectPermissionRequest>,
+) -> Response {
+    if !same_origin_browser_request(&headers, &state.config) {
+        return admin_text_response(
+            StatusCode::FORBIDDEN,
+            "identity: same-origin request required",
+        );
+    }
+    let response = reject_permission_request(State(state), headers, Path(id), Json(request)).await;
+    permission_decision_form_response(response, "reject").await
+}
+
+pub(crate) async fn admin_create_automation_credential_form(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<AutomationCredentialForm>,
+) -> Response {
+    if !same_origin_browser_request(&headers, &state.config) {
+        return admin_text_response(
+            StatusCode::FORBIDDEN,
+            "identity: same-origin request required",
+        );
+    }
+    if !(1..=90).contains(&form.expires_in_days) {
+        return admin_redirect_response(
+            "/admin/identity?error=credential%20expiry%20must%20be%201%20to%2090%20days",
+        );
+    }
+    let request = CreateAutomationCredentialRequest {
+        label: form.label,
+        expires_at_unix: unix_now_i64() + form.expires_in_days * 24 * 60 * 60,
+        scopes: form.scopes,
+    };
+    let response = create_automation_credential(State(state), headers, Json(request)).await;
+    if response.status() != StatusCode::CREATED {
+        return permission_decision_form_response(response, "credential creation").await;
+    }
+    let bytes = match to_bytes(response.into_body(), 8192).await {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return admin_text_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "identity: credential created, but its one-time response could not be read",
+            )
         }
-        Err(error) => admin_redirect_response(&format!(
+    };
+    let value: serde_json::Value = match serde_json::from_slice(&bytes) {
+        Ok(value) => value,
+        Err(_) => {
+            return admin_text_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "identity: credential created, but its response was invalid",
+            )
+        }
+    };
+    let token = value
+        .get("bearer_token")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let label = value
+        .get("label")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("automation");
+    admin_private_response(Html(format!(
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Credential created · Vapor Identity</title><link rel=\"stylesheet\" href=\"/admin/assets/admin.css\"><script defer src=\"/admin/assets/admin.js\"></script></head><body><main id=\"admin-content\"><p class=\"eyebrow\">Identity</p><h1>Credential created</h1><p>Copy this request-only secret now. It will not be shown again.</p><p><strong>{}</strong></p><pre><code>{}</code></pre><p><a href=\"/admin/identity\">Return to Identity administration</a></p></main></body></html>",
+        html_escape(label), html_escape(token)
+    )).into_response())
+}
+
+pub(crate) async fn admin_revoke_automation_credential_form(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    if !same_origin_browser_request(&headers, &state.config) {
+        return admin_text_response(
+            StatusCode::FORBIDDEN,
+            "identity: same-origin request required",
+        );
+    }
+    match revoke_automation_credential(State(state), headers, Path(id))
+        .await
+        .status()
+    {
+        StatusCode::NO_CONTENT => {
+            admin_redirect_response("/admin/identity?notice=automation%20credential%20revoked")
+        }
+        status => admin_redirect_response(&format!(
             "/admin/identity?error={}",
-            percent_encode(&format!("role revoke failed: {}", error.message))
+            percent_encode(&format!("credential revoke failed ({status})"))
         )),
     }
+}
+
+async fn permission_decision_form_response(response: Response, decision: &str) -> Response {
+    if response.status().is_success() {
+        return admin_redirect_response(&format!(
+            "/admin/identity?notice={}",
+            percent_encode(&format!("Permission request {decision}ed"))
+        ));
+    }
+    let status = response.status();
+    let body = match to_bytes(response.into_body(), 8192).await {
+        Ok(body) => String::from_utf8_lossy(&body).trim().to_string(),
+        Err(_) => "request failed".to_string(),
+    };
+    admin_redirect_response(&format!(
+        "/admin/identity?error={}",
+        percent_encode(&format!(
+            "Permission request {decision} failed ({status}): {body}"
+        ))
+    ))
 }
 
 fn role_action_forms(row: &ProfileRow) -> String {

@@ -153,6 +153,73 @@ pub(crate) async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error>
     .execute(&mut *tx)
     .await?;
     sqlx::query(
+        "CREATE TABLE IF NOT EXISTS automation_credentials (
+            id TEXT PRIMARY KEY,
+            token_hash TEXT NOT NULL UNIQUE CHECK (length(token_hash) = 64),
+            label TEXT NOT NULL,
+            scopes TEXT NOT NULL,
+            created_by_profile_id TEXT NOT NULL REFERENCES profiles(id) ON DELETE RESTRICT,
+            created_at_unix INTEGER NOT NULL,
+            expires_at_unix INTEGER NOT NULL,
+            revoked_at_unix INTEGER
+        )",
+    )
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS permission_requests (
+            id TEXT PRIMARY KEY,
+            body_hash TEXT NOT NULL CHECK (length(body_hash) = 64),
+            action TEXT NOT NULL CHECK (action IN ('grant', 'revoke')),
+            role TEXT NOT NULL CHECK (role IN ('root', 'content-developer')),
+            steam_id64 TEXT NOT NULL,
+            github_login TEXT NOT NULL,
+            resolved_profile_id TEXT NOT NULL REFERENCES profiles(id) ON DELETE RESTRICT,
+            requester_profile_id TEXT NOT NULL REFERENCES profiles(id) ON DELETE RESTRICT,
+            requester_credential_id TEXT REFERENCES automation_credentials(id) ON DELETE RESTRICT,
+            role_active_at_request INTEGER NOT NULL DEFAULT 0 CHECK (role_active_at_request IN (0, 1)),
+            status TEXT NOT NULL CHECK (status IN ('pending', 'succeeded', 'rejected', 'cancelled', 'expired', 'stale')),
+            version INTEGER NOT NULL DEFAULT 1 CHECK (version > 0),
+            created_at_unix INTEGER NOT NULL,
+            expires_at_unix INTEGER NOT NULL,
+            decided_by_profile_id TEXT REFERENCES profiles(id) ON DELETE RESTRICT,
+            decided_at_unix INTEGER,
+            decision_reason TEXT
+        )",
+    )
+    .execute(&mut *tx)
+    .await?;
+    let permission_request_columns = sqlx::query("PRAGMA table_info(permission_requests)")
+        .fetch_all(&mut *tx)
+        .await?;
+    if !permission_request_columns
+        .iter()
+        .any(|row| row.get::<String, _>("name") == "role_active_at_request")
+    {
+        sqlx::query("ALTER TABLE permission_requests ADD COLUMN role_active_at_request INTEGER NOT NULL DEFAULT 0 CHECK (role_active_at_request IN (0, 1))")
+            .execute(&mut *tx)
+            .await?;
+    }
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_permission_requests_status
+         ON permission_requests (status, expires_at_unix, created_at_unix)",
+    )
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "INSERT OR IGNORE INTO service_metadata (key, value, updated_at_unix)
+         VALUES ('permission_mutation_lock', '0', ?)",
+    )
+    .bind(unix_now_i64())
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_automation_credentials_active
+         ON automation_credentials (expires_at_unix, revoked_at_unix)",
+    )
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
         "CREATE INDEX IF NOT EXISTS idx_auth_attempts_active
          ON auth_attempts (expires_at_unix, consumed_at_unix)",
     )
@@ -194,6 +261,27 @@ pub(crate) async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error>
     sqlx::query(
         "INSERT OR IGNORE INTO schema_migrations (version, name, applied_at_unix)
          VALUES (4, 'steam_product_entitlement_cache', ?)",
+    )
+    .bind(unix_now_i64())
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "INSERT OR IGNORE INTO schema_migrations (version, name, applied_at_unix)
+         VALUES (5, 'scoped_automation_credentials', ?)",
+    )
+    .bind(unix_now_i64())
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "INSERT OR IGNORE INTO schema_migrations (version, name, applied_at_unix)
+         VALUES (6, 'permission_change_requests', ?)",
+    )
+    .bind(unix_now_i64())
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "INSERT OR IGNORE INTO schema_migrations (version, name, applied_at_unix)
+         VALUES (7, 'permission_role_state_snapshot', ?)",
     )
     .bind(unix_now_i64())
     .execute(&mut *tx)
@@ -260,6 +348,8 @@ pub(crate) async fn export_identity_state(
     let auth_attempt_count = count_rows(pool, "auth_attempts").await?;
     let session_count = count_rows(pool, "identity_sessions").await?;
     let browser_login_attempt_count = count_rows(pool, "browser_login_attempts").await?;
+    let automation_credential_count = count_rows(pool, "automation_credentials").await?;
+    let permission_request_count = count_rows(pool, "permission_requests").await?;
 
     let mut body = String::new();
     body.push_str("database = \"sqlite\"\n");
@@ -290,6 +380,12 @@ pub(crate) async fn export_identity_state(
     body.push_str(&format!(
         "browser_login_attempts = {browser_login_attempt_count}\n"
     ));
+    body.push_str(&format!(
+        "automation_credentials = {automation_credential_count}\n"
+    ));
+    body.push_str(&format!(
+        "permission_requests = {permission_request_count}\n"
+    ));
     Ok(body)
 }
 
@@ -303,6 +399,8 @@ pub(crate) async fn count_rows(pool: &SqlitePool, table: &str) -> Result<i64, sq
         "auth_attempts" => "SELECT COUNT(*) FROM auth_attempts",
         "identity_sessions" => "SELECT COUNT(*) FROM identity_sessions",
         "browser_login_attempts" => "SELECT COUNT(*) FROM browser_login_attempts",
+        "automation_credentials" => "SELECT COUNT(*) FROM automation_credentials",
+        "permission_requests" => "SELECT COUNT(*) FROM permission_requests",
         _ => unreachable!("table name is constrained by caller"),
     };
     sqlx::query_scalar(sql).fetch_one(pool).await

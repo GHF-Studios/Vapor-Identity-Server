@@ -3,6 +3,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 
+use crate::permission_requests::{create_permission_request, CreatePermissionRequest};
 use crate::persistence::*;
 use crate::types::*;
 use crate::util::{authorized, text_response, valid_github_login, valid_steam_id64};
@@ -97,6 +98,20 @@ pub(crate) async fn grant_profile_role(
         }
     };
 
+    if actor_profile_id.is_some() {
+        return create_permission_request(
+            State(state),
+            headers,
+            Json(CreatePermissionRequest {
+                action: "grant".to_string(),
+                role: request.role,
+                steam_id64: request.steam_id64,
+                github_login: request.github_login,
+            }),
+        )
+        .await;
+    }
+
     match grant_role_request(&state, &request, actor_profile_id.as_deref()).await {
         Ok(response) => (StatusCode::OK, Json(response)).into_response(),
         Err(error) => text_response(error.status, &format!("identity: {}", error.message)),
@@ -114,6 +129,20 @@ pub(crate) async fn revoke_profile_role(
             return text_response(error.status, &format!("identity: {}", error.message));
         }
     };
+
+    if actor_profile_id.is_some() {
+        return create_permission_request(
+            State(state),
+            headers,
+            Json(CreatePermissionRequest {
+                action: "revoke".to_string(),
+                role: request.role,
+                steam_id64: request.steam_id64,
+                github_login: request.github_login,
+            }),
+        )
+        .await;
+    }
 
     match revoke_role_request(&state, &request, actor_profile_id.as_deref()).await {
         Ok(response) => (StatusCode::OK, Json(response)).into_response(),

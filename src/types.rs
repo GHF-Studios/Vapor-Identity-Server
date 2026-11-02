@@ -9,6 +9,7 @@ pub(crate) struct AppState {
     pub(crate) pool: SqlitePool,
     pub(crate) db_path: Arc<PathBuf>,
     pub(crate) admin_token: Option<String>,
+    pub(crate) platform_request_authz_token: Option<String>,
     pub(crate) config: Arc<AuthConfig>,
     pub(crate) http: reqwest::Client,
 }

@@ -74,6 +74,12 @@ GET  /v1/admin/profiles
 GET  /v1/admin/audit
 POST /v1/admin/roles/grant
 POST /v1/admin/roles/revoke
+GET  /v1/admin/permission-requests
+POST /v1/admin/permission-requests
+POST /v1/admin/permission-requests/{id}/approve
+POST /v1/admin/permission-requests/{id}/reject
+GET  /v1/admin/automation-credentials
+POST /v1/admin/automation-credentials
 POST /v1/init
 GET  /v1/export
 GET  /login
@@ -85,6 +91,9 @@ GET  /logout
 GET  /admin/identity
 POST /admin/identity/roles/grant
 POST /admin/identity/roles/revoke
+POST /admin/identity/permission-requests/{id}/approve
+POST /admin/identity/permission-requests/{id}/reject
+POST /admin/identity/automation-credentials
 ```
 
 Protected routes expect:
@@ -116,10 +125,14 @@ Dashboard sessions currently expire after 300 seconds.
 It can initialize the database and grant/bootstrap the first root role, but it
 is not the normal dashboard login model.
 
-`POST /v1/admin/roles/grant` is the elevated role-grant route. It requires
-either the server-local bootstrap/admin token or a non-expired root dashboard
-session. It grants `root` or `content-developer` only when the request provides
-both external identities for the same already-linked profile:
+`POST /v1/admin/roles/grant` and `/v1/admin/roles/revoke` accept either the
+server-local break-glass token or a root dashboard session. A root session
+creates a pending permission request; the local token remains an explicit
+server-side emergency path. A request credential can only submit the matching
+request kind and cannot approve, reject, or mutate roles directly.
+
+`POST /v1/admin/permission-requests` accepts a role-change request using linked
+external identities (never an internal profile id):
 
 ```json
 {"role":"root","steam_id64":"7656119...","github_login":"example"}
@@ -133,11 +146,27 @@ Root/admin capability also implies content-developer capability in
 authorization policy. Effective role responses include `content-developer` for
 root profiles even when only the `root` row is stored.
 
-`POST /admin/identity/roles/grant` is the browser form wrapper for the same grant
-logic. It requires a non-expired root dashboard session and a request Origin
-exactly matching the configured `VAPOR_IDENTITY_PUBLIC_ORIGIN`; missing or
-mismatched Origin is rejected. It is intended to replace server-local token
-handling for normal admin role management after bootstrap.
+`GET /v1/admin/permission-requests` is available to root sessions and to a
+request credential only for requests created with that credential. API
+responses omit internal profile and credential database ids. Requests expire
+after seven days; the immutable body digest binds action, role, SteamID64, and
+GitHub login.
+
+`POST /v1/admin/permission-requests/{id}/approve` and `/reject` require a current
+root dashboard session, exact configured Origin, expected request version, and
+explicit `confirmed: true`. Approval rechecks the linked account pair, role
+state captured at request time, root-implies-developer rule, and last-root
+invariant. It applies the role, updates the ticket, and writes audit records in
+one SQLite transaction. Changed identity or role state marks the ticket stale.
+The dashboard requires confirmation checkboxes for decisions.
+
+The Identity dashboard creates, lists, and revokes request-only API
+credentials. Their bearer secret appears once on creation; Identity stores only
+its digest. Scopes are limited to `platform:deploy-request:create` and
+`identity:role-request:create`.
+
+`POST /admin/identity/roles/grant` and `/revoke` are same-origin browser forms
+that create pending requests and require an exact configured Origin.
 
 `POST /v1/admin/roles/revoke` and `POST /admin/identity/roles/revoke` use the same
 authorization and external-identity target model as grants. Revocation requires
@@ -163,6 +192,7 @@ VAPOR_IDENTITY_STEAM_AUTH_IDENTITY=vapor-identity
 VAPOR_IDENTITY_STEAM_WEB_API_KEY=
 VAPOR_IDENTITY_AUTHZ_SERVICE_TOKEN=
 VAPOR_IDENTITY_PLATFORM_ADMIN_AUTHZ_TOKEN=
+VAPOR_IDENTITY_PLATFORM_REQUEST_AUTHZ_TOKEN=
 VAPOR_IDENTITY_GITHUB_CLIENT_ID=
 VAPOR_IDENTITY_GITHUB_CLIENT_SECRET=
 ```
@@ -179,7 +209,11 @@ GitHub browser OAuth requires server-local client ID and client secret.
 `VAPOR_IDENTITY_LOOCAST_APP_ID` selects the publisher-owned Loo-Cast App ID for
 server-side entitlement verification. `VAPOR_IDENTITY_AUTHZ_SERVICE_TOKEN` is
 shared only with Registry, while `VAPOR_IDENTITY_PLATFORM_ADMIN_AUTHZ_TOKEN` is
-shared only with Platform Server. Both are 64-character hexadecimal secrets.
+shared only with Platform Server. `VAPOR_IDENTITY_PLATFORM_REQUEST_AUTHZ_TOKEN`
+is a separate service-to-service token used only when Platform asks Identity
+to verify a request-only deploy credential. These are distinct 64-character
+hexadecimal secrets; the deploy request bearer itself is separately hashed in
+Identity's database.
 Identity uses the audience-specific token to protect
 `POST /v1/internal/authorization/check`; that route returns only an allow/deny
 decision for the current user and an allowlisted service audience. The Steam

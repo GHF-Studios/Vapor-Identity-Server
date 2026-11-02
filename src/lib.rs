@@ -2,10 +2,12 @@ mod admin_handlers;
 mod api_handlers;
 mod auth_attempts;
 mod authorization_handlers;
+mod automation_credentials;
 mod browser_handlers;
 mod config;
 mod db;
 mod entitlements;
+mod permission_requests;
 mod persistence;
 mod profiles;
 mod provider_handlers;
@@ -15,7 +17,12 @@ mod status_handlers;
 mod types;
 mod util;
 
+use axum::body::Body;
 use axum::extract::DefaultBodyLimit;
+use axum::http::header::CACHE_CONTROL;
+use axum::http::Request;
+use axum::middleware::{from_fn, Next};
+use axum::response::Response;
 use axum::routing::{get, post};
 use axum::Router;
 use std::env;
@@ -25,9 +32,17 @@ use tokio::fs;
 
 use crate::api_handlers::*;
 use crate::authorization_handlers::check_authorization;
+use crate::automation_credentials::{
+    create_automation_credential, list_automation_credentials, revoke_automation_credential,
+    verify_automation_credential,
+};
 use crate::browser_handlers::*;
 use crate::config::{read_auth_config, DEFAULT_DB_NAME, DEFAULT_STATE_DIR, MAX_AUTH_BODY_BYTES};
 use crate::db::{open_database, run_migrations};
+use crate::permission_requests::{
+    approve_permission_request, create_permission_request, list_permission_requests,
+    reject_permission_request,
+};
 use crate::types::AppState;
 
 pub struct HostRouters {
@@ -67,6 +82,9 @@ pub async fn routers_from_env() -> Result<HostRouters, Box<dyn std::error::Error
         admin_token: env::var("VAPOR_IDENTITY_ADMIN_TOKEN")
             .ok()
             .filter(|value| !value.is_empty()),
+        platform_request_authz_token: env::var("VAPOR_IDENTITY_PLATFORM_REQUEST_AUTHZ_TOKEN")
+            .ok()
+            .filter(|value| !value.is_empty()),
         config,
         http,
     };
@@ -97,12 +115,37 @@ pub async fn routers_from_env() -> Result<HostRouters, Box<dyn std::error::Error
             "/v1/internal/authorization/check",
             post(check_authorization),
         )
+        .route(
+            "/v1/internal/automation/verify",
+            post(verify_automation_credential),
+        )
         .route("/v1/admin/profiles", get(list_profiles))
         .route("/v1/admin/audit", get(list_audit_events))
+        .route(
+            "/v1/admin/automation-credentials",
+            get(list_automation_credentials).post(create_automation_credential),
+        )
+        .route(
+            "/v1/admin/automation-credentials/{id}/revoke",
+            post(revoke_automation_credential),
+        )
+        .route(
+            "/v1/admin/permission-requests",
+            get(list_permission_requests).post(create_permission_request),
+        )
+        .route(
+            "/v1/admin/permission-requests/{id}/approve",
+            post(approve_permission_request),
+        )
+        .route(
+            "/v1/admin/permission-requests/{id}/reject",
+            post(reject_permission_request),
+        )
         .route("/v1/admin/roles/grant", post(grant_profile_role))
         .route("/v1/admin/roles/revoke", post(revoke_profile_role))
         .route("/v1/init", post(init))
         .route("/v1/export", get(export_identity))
+        .route_layer(from_fn(no_store_admin_responses))
         .layer(DefaultBodyLimit::max(MAX_AUTH_BODY_BYTES))
         .with_state(state.clone());
     let web = Router::new()
@@ -117,8 +160,33 @@ pub async fn routers_from_env() -> Result<HostRouters, Box<dyn std::error::Error
         .route("/admin/identity/", get(admin_dashboard))
         .route("/admin/identity/roles/grant", post(admin_grant_role_form))
         .route("/admin/identity/roles/revoke", post(admin_revoke_role_form))
+        .route(
+            "/admin/identity/permission-requests/{id}/approve",
+            post(admin_approve_permission_request_form),
+        )
+        .route(
+            "/admin/identity/permission-requests/{id}/reject",
+            post(admin_reject_permission_request_form),
+        )
+        .route(
+            "/admin/identity/automation-credentials",
+            post(admin_create_automation_credential_form),
+        )
+        .route(
+            "/admin/identity/automation-credentials/{id}/revoke",
+            post(admin_revoke_automation_credential_form),
+        )
         .layer(DefaultBodyLimit::max(MAX_AUTH_BODY_BYTES))
         .with_state(state);
 
     Ok(HostRouters { api, web })
+}
+
+async fn no_store_admin_responses(request: Request<Body>, next: Next) -> Response {
+    let mut response = next.run(request).await;
+    response.headers_mut().insert(
+        CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    response
 }

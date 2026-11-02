@@ -19,6 +19,8 @@ pub(crate) struct AuthorizationCheckRequest {
     audience: String,
     session_token: String,
     policy: AuthorizationPolicy,
+    #[serde(default)]
+    include_profile_id: bool,
 }
 
 #[derive(Deserialize)]
@@ -58,6 +60,8 @@ enum LicenseMode {
 struct AuthorizationCheckResponse {
     allowed: bool,
     expires_at_unix: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    profile_id: Option<String>,
 }
 
 pub(crate) async fn check_authorization(
@@ -89,7 +93,7 @@ pub(crate) async fn check_authorization(
     let profile = match profile_from_session_token(&state.pool, &request.session_token).await {
         Ok(Some(profile)) => profile,
         Ok(None) => {
-            return authorization_response(false, unix_now_i64());
+            return authorization_response(false, unix_now_i64(), None);
         }
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
@@ -136,7 +140,8 @@ pub(crate) async fn check_authorization(
         PolicyMode::All => all_allowed,
         PolicyMode::Any => any_allowed,
     };
-    authorization_response(allowed, earliest_expiry)
+    let profile_id = (allowed && request.include_profile_id).then(|| profile.profile_id.clone());
+    authorization_response(allowed, earliest_expiry, profile_id)
 }
 
 fn service_token_for_audience<'a>(
@@ -184,13 +189,18 @@ async fn product_entitlement(
     Ok((ownership, expires_at))
 }
 
-fn authorization_response(allowed: bool, expires_at_unix: i64) -> Response {
+fn authorization_response(
+    allowed: bool,
+    expires_at_unix: i64,
+    profile_id: Option<String>,
+) -> Response {
     (
         StatusCode::OK,
         [("cache-control", "no-store")],
         Json(AuthorizationCheckResponse {
             allowed,
             expires_at_unix,
+            profile_id,
         }),
     )
         .into_response()
