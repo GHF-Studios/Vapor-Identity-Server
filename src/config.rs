@@ -4,6 +4,7 @@ pub(crate) const DEFAULT_BIND: &str = "127.0.0.1:7113";
 pub(crate) const DEFAULT_STATE_DIR: &str = "state/identity";
 pub(crate) const DEFAULT_DB_NAME: &str = "identity.sqlite3";
 pub(crate) const DEFAULT_STEAM_APP_ID: u32 = 2_122_620;
+pub(crate) const DEFAULT_LOOCAST_APP_ID: u32 = 2_122_620;
 pub(crate) const DEFAULT_STEAM_AUTH_IDENTITY: &str = "vapor-identity";
 pub(crate) const MAX_AUTH_BODY_BYTES: usize = 16 * 1024;
 pub(crate) const AUTH_ATTEMPT_TTL_SECONDS: i64 = 5 * 60;
@@ -17,6 +18,11 @@ pub(crate) struct AuthConfig {
     pub(crate) steam_app_id: u32,
     pub(crate) steam_auth_identity: String,
     pub(crate) steam_web_api_key: Option<String>,
+    pub(crate) loocast_app_id: u32,
+    pub(crate) authorization_service_token: Option<String>,
+    pub(crate) platform_admin_authorization_service_token: Option<String>,
+    pub(crate) artifact_admin_authorization_service_token: Option<String>,
+    pub(crate) build_cache_admin_authorization_service_token: Option<String>,
     pub(crate) github_client_id: Option<String>,
     pub(crate) github_client_secret: Option<String>,
     pub(crate) dashboard_password: Option<String>,
@@ -38,6 +44,29 @@ pub(crate) fn read_auth_config() -> AuthConfig {
         steam_web_api_key: env::var("VAPOR_IDENTITY_STEAM_WEB_API_KEY")
             .ok()
             .filter(|value| !value.is_empty()),
+        loocast_app_id: env::var("VAPOR_IDENTITY_LOOCAST_APP_ID")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .filter(|value| *value != 0)
+            .unwrap_or(DEFAULT_LOOCAST_APP_ID),
+        authorization_service_token: env::var("VAPOR_IDENTITY_AUTHZ_SERVICE_TOKEN")
+            .ok()
+            .filter(|value| valid_service_token(value)),
+        platform_admin_authorization_service_token: env::var(
+            "VAPOR_IDENTITY_PLATFORM_ADMIN_AUTHZ_TOKEN",
+        )
+        .ok()
+        .filter(|value| valid_service_token(value)),
+        artifact_admin_authorization_service_token: env::var(
+            "VAPOR_IDENTITY_ARTIFACT_ADMIN_AUTHZ_TOKEN",
+        )
+        .ok()
+        .filter(|value| valid_service_token(value)),
+        build_cache_admin_authorization_service_token: env::var(
+            "VAPOR_IDENTITY_BUILD_CACHE_ADMIN_AUTHZ_TOKEN",
+        )
+        .ok()
+        .filter(|value| valid_service_token(value)),
         github_client_id: env::var("VAPOR_IDENTITY_GITHUB_CLIENT_ID")
             .ok()
             .filter(|value| !value.is_empty()),
@@ -63,6 +92,10 @@ pub(crate) fn read_auth_config() -> AuthConfig {
             .ok()
             .filter(|value| valid_public_origin(value)),
     }
+}
+
+fn valid_service_token(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn valid_public_origin(value: &str) -> bool {

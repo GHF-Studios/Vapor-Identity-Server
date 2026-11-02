@@ -128,6 +128,19 @@ pub(crate) async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error>
     .execute(&mut *tx)
     .await?;
     sqlx::query(
+        "CREATE TABLE IF NOT EXISTS steam_product_entitlement_cache (
+            steam_id64 TEXT NOT NULL,
+            product_id TEXT NOT NULL,
+            active INTEGER NOT NULL CHECK (active IN (0, 1)),
+            permanent INTEGER NOT NULL CHECK (permanent IN (0, 1)),
+            checked_at_unix INTEGER NOT NULL,
+            expires_at_unix INTEGER NOT NULL,
+            PRIMARY KEY (steam_id64, product_id)
+        )",
+    )
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
         "CREATE TABLE IF NOT EXISTS browser_login_attempts (
             state TEXT PRIMARY KEY,
             flow TEXT NOT NULL CHECK (flow IN ('steam', 'github')),
@@ -174,6 +187,13 @@ pub(crate) async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error>
     sqlx::query(
         "INSERT OR IGNORE INTO schema_migrations (version, name, applied_at_unix)
          VALUES (3, 'browser_login_attempts', ?)",
+    )
+    .bind(unix_now_i64())
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "INSERT OR IGNORE INTO schema_migrations (version, name, applied_at_unix)
+         VALUES (4, 'steam_product_entitlement_cache', ?)",
     )
     .bind(unix_now_i64())
     .execute(&mut *tx)

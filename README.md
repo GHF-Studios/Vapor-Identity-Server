@@ -51,6 +51,11 @@ VAPOR_IDENTITY_COOKIE_SECURE=false
 VAPOR_IDENTITY_PUBLIC_ORIGIN=
 ```
 
+`VAPOR_IDENTITY_PUBLIC_ORIGIN` must be the exact HTTPS origin used by the
+browser (scheme and host, with no trailing slash) for Identity admin form
+submissions. If it is unset, those writes fail closed; request-provided Host or
+forwarding headers are not accepted as the CSRF trust anchor.
+
 ## Initial routes
 
 ```text
@@ -77,9 +82,9 @@ GET  /login/steam/callback
 GET  /login/github
 GET  /login/github/callback
 GET  /logout
-GET  /admin
-POST /admin/roles/grant
-POST /admin/roles/revoke
+GET  /admin/identity
+POST /admin/identity/roles/grant
+POST /admin/identity/roles/revoke
 ```
 
 Protected routes expect:
@@ -93,10 +98,13 @@ browser profile creation path; it creates or resumes a Steam-anchored profile
 without a Vapor username/password. GitHub browser OAuth can then link GitHub to
 the current Steam profile once the GitHub app credentials are configured.
 
-`GET /admin` is a publicly reachable dashboard shell. It does not use HTTP Basic
-auth as identity authorization. It only renders privileged identity data/actions
-when the request carries a non-expired Vapor identity session for a profile that
-has:
+`GET /admin` is owned by Vapor Platform Server and renders the shared admin
+toolbench shell. Identity's service-owned section is `GET /admin/identity`; the
+previous standalone Identity `/admin` page and its old form routes are removed
+without redirects or compatibility aliases. The Identity section does not use
+HTTP Basic auth as identity authorization. It only renders privileged identity
+data/actions when the request carries a non-expired Vapor identity session for a
+profile that has:
 
 - a linked Steam identity;
 - a linked GitHub identity;
@@ -125,11 +133,13 @@ Root/admin capability also implies content-developer capability in
 authorization policy. Effective role responses include `content-developer` for
 root profiles even when only the `root` row is stored.
 
-`POST /admin/roles/grant` is the browser form wrapper for the same grant logic.
-It requires a non-expired root dashboard session and is intended to replace
-server-local token handling for normal admin role management after bootstrap.
+`POST /admin/identity/roles/grant` is the browser form wrapper for the same grant
+logic. It requires a non-expired root dashboard session and a request Origin
+exactly matching the configured `VAPOR_IDENTITY_PUBLIC_ORIGIN`; missing or
+mismatched Origin is rejected. It is intended to replace server-local token
+handling for normal admin role management after bootstrap.
 
-`POST /v1/admin/roles/revoke` and `POST /admin/roles/revoke` use the same
+`POST /v1/admin/roles/revoke` and `POST /admin/identity/roles/revoke` use the same
 authorization and external-identity target model as grants. Revocation requires
 the SteamID64 and GitHub login to resolve to the same linked profile. The
 service refuses to revoke the last active `root` role so a normal dashboard/API
@@ -148,8 +158,11 @@ Server-local env only:
 
 ```text
 VAPOR_IDENTITY_STEAM_APP_ID=2122620
+VAPOR_IDENTITY_LOOCAST_APP_ID=2122620
 VAPOR_IDENTITY_STEAM_AUTH_IDENTITY=vapor-identity
 VAPOR_IDENTITY_STEAM_WEB_API_KEY=
+VAPOR_IDENTITY_AUTHZ_SERVICE_TOKEN=
+VAPOR_IDENTITY_PLATFORM_ADMIN_AUTHZ_TOKEN=
 VAPOR_IDENTITY_GITHUB_CLIENT_ID=
 VAPOR_IDENTITY_GITHUB_CLIENT_SECRET=
 ```
@@ -162,6 +175,16 @@ verifies it against GitHub before storing only the GitHub user id/login.
 Browser login uses Steam OpenID for Steam identity and GitHub OAuth web flow for
 GitHub linking. Steam OpenID does not require the Steam publisher Web API key.
 GitHub browser OAuth requires server-local client ID and client secret.
+
+`VAPOR_IDENTITY_LOOCAST_APP_ID` selects the publisher-owned Loo-Cast App ID for
+server-side entitlement verification. `VAPOR_IDENTITY_AUTHZ_SERVICE_TOKEN` is
+shared only with Registry, while `VAPOR_IDENTITY_PLATFORM_ADMIN_AUTHZ_TOKEN` is
+shared only with Platform Server. Both are 64-character hexadecimal secrets.
+Identity uses the audience-specific token to protect
+`POST /v1/internal/authorization/check`; that route returns only an allow/deny
+decision for the current user and an allowlisted service audience. The Steam
+publisher key is used server-side for configured product-license checks and is
+never returned by Identity.
 
 ## Steam authority model
 
@@ -213,9 +236,11 @@ src/status_handlers.rs    health/status/init/export routes
 src/admin_handlers.rs     admin profile listing, role, and audit routes
 src/session_handlers.rs   API auth-attempt and short session flow
 src/provider_handlers.rs  direct Steam/GitHub verification probes
-src/browser_handlers.rs   /login, /logout, /admin browser routes
+src/browser_handlers.rs   /login, /logout, /admin/identity browser routes
 src/db.rs                 SQLite connection, migration, export counters
 src/auth_attempts.rs      short-lived auth/browser attempt persistence
+src/authorization_handlers.rs Identity-backed cross-service decisions
+src/entitlements.rs      short-lived Steam product entitlement cache
 src/profiles.rs           Steam-anchored profiles, sessions, roles
 src/providers.rs          Steam/GitHub external verification calls
 src/util.rs               small shared helpers and HTML shell rendering

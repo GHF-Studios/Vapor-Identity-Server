@@ -8,6 +8,54 @@ use crate::config::STEAM_OPENID_ENDPOINT;
 use crate::types::{GitHubAccessTokenResponse, GitHubUser};
 use crate::util::{steam_id_from_openid_claim, steam_id_from_response, text_response};
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SteamAppOwnership {
+    pub(crate) active: bool,
+    pub(crate) permanent: bool,
+}
+
+pub(crate) async fn check_steam_app_ownership(
+    http: &reqwest::Client,
+    publisher_key: &str,
+    steam_id64: &str,
+    app_id: u32,
+) -> Result<SteamAppOwnership, ()> {
+    let app_id = app_id.to_string();
+    let response = http
+        .get("https://partner.steam-api.com/ISteamUser/CheckAppOwnership/v4/")
+        .query(&[
+            ("key", publisher_key),
+            ("steamid", steam_id64),
+            ("appid", app_id.as_str()),
+        ])
+        .send()
+        .await
+        .map_err(|_| ())?;
+    if !response.status().is_success() {
+        return Err(());
+    }
+
+    let body = response.json::<Value>().await.map_err(|_| ())?;
+    let ownership = body.get("appownership").unwrap_or(&body);
+    let active = ownership
+        .get("ownsapp")
+        .and_then(Value::as_bool)
+        .ok_or(())?;
+    let permanent = ownership
+        .get("permanent")
+        .and_then(Value::as_bool)
+        .ok_or(())?;
+    let canceled = ownership
+        .get("usercanceled")
+        .and_then(Value::as_bool)
+        .ok_or(())?;
+
+    Ok(SteamAppOwnership {
+        active: active && !canceled,
+        permanent: active && permanent && !canceled,
+    })
+}
+
 pub(crate) async fn verify_steam_ticket(
     http: &reqwest::Client,
     key: &str,

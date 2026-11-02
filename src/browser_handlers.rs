@@ -1,5 +1,5 @@
 use axum::extract::{Query, State};
-use axum::http::header::{LOCATION, SET_COOKIE};
+use axum::http::header::{CACHE_CONTROL, LOCATION, SET_COOKIE};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::Form;
@@ -15,8 +15,8 @@ use crate::types::*;
 use crate::util::{
     admin_locked_html, expired_session_cookie, github_browser_ready, html_escape, login_html,
     new_browser_login_state, percent_encode, public_origin, redirect_response,
-    redirect_with_cookie, session_token_from_headers, text_response, unix_now_i64,
-    valid_browser_state,
+    redirect_with_cookie, same_origin_browser_request, session_token_from_headers, text_response,
+    unix_now_i64, valid_browser_state,
 };
 
 pub(crate) async fn login_page(
@@ -335,39 +335,36 @@ pub(crate) async fn admin_dashboard(
 ) -> impl IntoResponse {
     let current = match current_profile_from_headers(&state.pool, &headers).await {
         Ok(profile) => profile,
-        Err(error) => {
-            return (
+        Err(_) => {
+            return admin_text_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("identity: failed to validate dashboard session: {error}\n"),
-            )
-                .into_response();
+                "identity: failed to validate dashboard session",
+            );
         }
     };
     let Some(current) = current else {
-        return Html(admin_locked_html(None)).into_response();
+        return admin_html_response(admin_locked_html(None));
     };
     if !current.root_authorized {
-        return Html(admin_locked_html(Some(&current))).into_response();
+        return admin_html_response(admin_locked_html(Some(&current)));
     }
 
     let profile_rows = match profile_rows(&state.pool).await {
         Ok(rows) => rows,
-        Err(error) => {
-            return (
+        Err(_) => {
+            return admin_text_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("identity: failed to load dashboard: {error}\n"),
-            )
-                .into_response();
+                "identity: failed to load dashboard",
+            );
         }
     };
     let audit_rows = match recent_audit_events(&state.pool, 25).await {
         Ok(rows) => rows,
-        Err(error) => {
-            return (
+        Err(_) => {
+            return admin_text_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("identity: failed to load dashboard audit events: {error}\n"),
-            )
-                .into_response();
+                "identity: failed to load dashboard audit events",
+            );
         }
     };
     let mut rows = String::new();
@@ -416,16 +413,9 @@ pub(crate) async fn admin_dashboard(
         .map(|value| format!("<p class=\"error\">{}</p>", html_escape(value)))
         .unwrap_or_default();
 
-    Html(format!(
-        "<!doctype html><meta charset=\"utf-8\"><title>Vapor Identity Admin</title>\
-         <style>body{{max-width:1100px;margin:3rem auto;padding:0 1.5rem;font:16px/1.5 system-ui,sans-serif}}\
-         table{{border-collapse:collapse;width:100%}}td,th{{border:1px solid #ccc;padding:.4rem;text-align:left}}\
-         code{{background:#f4f4f4;padding:.1rem .25rem;border-radius:.2rem}}\
-         label{{display:block;margin:.6rem 0}}input,select{{font:inherit;padding:.3rem;min-width:20rem}}\
-         button{{font:inherit;padding:.4rem .7rem}}form.inline{{display:inline}}form.inline button{{padding:.2rem .45rem;margin:.1rem}}\
-         .notice{{background:#e7f6e7;padding:.6rem;border-left:4px solid #2d7a2d}}\
-         .error{{background:#fdeaea;padding:.6rem;border-left:4px solid #b42318}}</style>\
-         <h1>Vapor Identity Admin</h1>\
+    admin_html_response(format!(
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Vapor Identity</title><link rel=\"stylesheet\" href=\"/admin/assets/admin.css\"><script defer src=\"/admin/assets/admin.js\"></script></head><body><main id=\"admin-content\">\
+         <p class=\"eyebrow\">Identity</p><h1>Accounts and access</h1>\
          <p>Signed in as Steam profile <code>{}</code>. Root role is active.</p>\
          <p><a href=\"/login\">Identity</a> · <a href=\"/logout\">Logout</a></p>\
          {notice}{error}\
@@ -434,7 +424,7 @@ pub(crate) async fn admin_dashboard(
          <li>GitHub browser login configured: <code>{}</code></li>\
          <li>Dashboard session TTL: <code>{DASHBOARD_SESSION_TTL_SECONDS}s</code></li></ul>\
          <h2>Grant role</h2>\
-         <form method=\"post\" action=\"/admin/roles/grant\">\
+         <form method=\"post\" action=\"/admin/identity/roles/grant\">\
          <label>Role <select name=\"role\"><option value=\"content-developer\">content-developer</option><option value=\"root\">root</option></select></label>\
          <label>SteamID64 <input name=\"steam_id64\" inputmode=\"numeric\" pattern=\"[0-9]{{17}}\" required></label>\
          <label>GitHub login <input name=\"github_login\" required></label>\
@@ -442,11 +432,30 @@ pub(crate) async fn admin_dashboard(
          <p>This form requires your root dashboard session. It still refuses grants unless the SteamID64 and GitHub login are already linked to the same profile.</p>\
          <p>Root implies content-developer. To demote a root profile to developer, first grant <code>content-developer</code>, then revoke <code>root</code>.</p>\
          <h2>Profiles</h2><table><thead><tr><th>Name</th><th>Steam</th><th>GitHub</th><th>Effective roles</th><th>Actions</th></tr></thead><tbody>{rows}</tbody></table>\
-         <h2>Recent audit events</h2><table><thead><tr><th>ID</th><th>Unix time</th><th>Event</th><th>Actor</th><th>Subject</th><th>Detail</th></tr></thead><tbody>{audit}</tbody></table>",
+         <h2>Recent audit events</h2><table><thead><tr><th>ID</th><th>Unix time</th><th>Event</th><th>Actor</th><th>Subject</th><th>Detail</th></tr></thead><tbody>{audit}</tbody></table></main></body></html>",
         html_escape(current.steam_id64.as_deref().unwrap_or("unknown")),
         github_browser_ready(&state.config)
     ))
-    .into_response()
+}
+
+fn admin_html_response(body: String) -> Response {
+    admin_private_response(Html(body).into_response())
+}
+
+fn admin_text_response(status: StatusCode, body: &str) -> Response {
+    admin_private_response(text_response(status, body))
+}
+
+fn admin_redirect_response(location: &str) -> Response {
+    admin_private_response(redirect_response(location))
+}
+
+fn admin_private_response(mut response: Response) -> Response {
+    response.headers_mut().insert(
+        CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("private, no-store"),
+    );
+    response
 }
 
 pub(crate) async fn admin_grant_role_form(
@@ -454,23 +463,29 @@ pub(crate) async fn admin_grant_role_form(
     headers: HeaderMap,
     Form(request): Form<GrantRoleRequest>,
 ) -> Response {
+    if !same_origin_browser_request(&headers, &state.config) {
+        return admin_text_response(
+            StatusCode::FORBIDDEN,
+            "identity: admin form requires a same-origin browser request",
+        );
+    }
     let current = match current_profile_from_headers(&state.pool, &headers).await {
         Ok(Some(current)) => current,
         Ok(None) => {
-            return text_response(
+            return admin_text_response(
                 StatusCode::UNAUTHORIZED,
                 "identity: sign in with a root profile before granting roles",
             );
         }
         Err(error) => {
-            return text_response(
+            return admin_text_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 &format!("identity: failed to validate dashboard session: {error}"),
             );
         }
     };
     if !current.root_authorized {
-        return text_response(
+        return admin_text_response(
             StatusCode::FORBIDDEN,
             "identity: root role is required to grant roles",
         );
@@ -483,16 +498,16 @@ pub(crate) async fn admin_grant_role_form(
             } else {
                 "already active"
             };
-            redirect_response(&format!(
-                "/admin?notice={}",
+            admin_redirect_response(&format!(
+                "/admin/identity?notice={}",
                 percent_encode(&format!(
                     "{} {} for SteamID64 {} / GitHub {}",
                     action, response.role, response.steam_id64, response.github_login
                 ))
             ))
         }
-        Err(error) => redirect_response(&format!(
-            "/admin?error={}",
+        Err(error) => admin_redirect_response(&format!(
+            "/admin/identity?error={}",
             percent_encode(&format!("role grant failed: {}", error.message))
         )),
     }
@@ -503,23 +518,29 @@ pub(crate) async fn admin_revoke_role_form(
     headers: HeaderMap,
     Form(request): Form<RevokeRoleRequest>,
 ) -> Response {
+    if !same_origin_browser_request(&headers, &state.config) {
+        return admin_text_response(
+            StatusCode::FORBIDDEN,
+            "identity: admin form requires a same-origin browser request",
+        );
+    }
     let current = match current_profile_from_headers(&state.pool, &headers).await {
         Ok(Some(current)) => current,
         Ok(None) => {
-            return text_response(
+            return admin_text_response(
                 StatusCode::UNAUTHORIZED,
                 "identity: sign in with a root profile before revoking roles",
             );
         }
         Err(error) => {
-            return text_response(
+            return admin_text_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 &format!("identity: failed to validate dashboard session: {error}"),
             );
         }
     };
     if !current.root_authorized {
-        return text_response(
+        return admin_text_response(
             StatusCode::FORBIDDEN,
             "identity: root role is required to revoke roles",
         );
@@ -532,16 +553,16 @@ pub(crate) async fn admin_revoke_role_form(
             } else {
                 "was not active"
             };
-            redirect_response(&format!(
-                "/admin?notice={}",
+            admin_redirect_response(&format!(
+                "/admin/identity?notice={}",
                 percent_encode(&format!(
                     "{} {} for SteamID64 {} / GitHub {}",
                     action, response.role, response.steam_id64, response.github_login
                 ))
             ))
         }
-        Err(error) => redirect_response(&format!(
-            "/admin?error={}",
+        Err(error) => admin_redirect_response(&format!(
+            "/admin/identity?error={}",
             percent_encode(&format!("role revoke failed: {}", error.message))
         )),
     }
@@ -571,7 +592,7 @@ fn role_action_forms(row: &ProfileRow) -> String {
     let mut forms = String::new();
     for role in &row.stored_roles {
         forms.push_str(&format!(
-            "<form class=\"inline\" method=\"post\" action=\"/admin/roles/revoke\">\
+            "<form class=\"inline\" method=\"post\" action=\"/admin/identity/roles/revoke\">\
              <input type=\"hidden\" name=\"role\" value=\"{}\">\
              <input type=\"hidden\" name=\"steam_id64\" value=\"{}\">\
              <input type=\"hidden\" name=\"github_login\" value=\"{}\">\

@@ -19,6 +19,33 @@ pub(crate) fn authorized(headers: &HeaderMap, expected: &Option<String>) -> bool
         .is_some_and(|value| value == format!("Bearer {expected}"))
 }
 
+pub(crate) fn authorization_service_authorized(
+    headers: &HeaderMap,
+    expected: Option<&str>,
+) -> bool {
+    let Some(expected) = expected else {
+        return false;
+    };
+    let Some(provided) = headers
+        .get(AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+    else {
+        return false;
+    };
+    constant_time_equal(expected.as_bytes(), provided.as_bytes())
+}
+
+fn constant_time_equal(expected: &[u8], provided: &[u8]) -> bool {
+    let mut difference = expected.len() ^ provided.len();
+    for index in 0..expected.len().max(provided.len()) {
+        let left = expected.get(index).copied().unwrap_or(0);
+        let right = provided.get(index).copied().unwrap_or(0);
+        difference |= usize::from(left ^ right);
+    }
+    difference == 0
+}
+
 pub(crate) fn session_token_from_headers(headers: &HeaderMap) -> Option<String> {
     if let Some(token) = headers
         .get(AUTHORIZATION)
@@ -41,6 +68,16 @@ pub(crate) fn session_token_from_headers(headers: &HeaderMap) -> Option<String> 
                 None
             }
         })
+}
+
+pub(crate) fn same_origin_browser_request(headers: &HeaderMap, config: &AuthConfig) -> bool {
+    let Some(origin) = headers.get("origin").and_then(|value| value.to_str().ok()) else {
+        return false;
+    };
+    config
+        .public_origin
+        .as_deref()
+        .is_some_and(|expected| origin == expected)
 }
 
 pub(crate) fn session_cookie(config: &AuthConfig, token: &str, max_age_seconds: i64) -> String {
@@ -97,7 +134,7 @@ pub(crate) fn login_html(config: &AuthConfig, current: Option<&CurrentProfile>) 
              <dt>GitHub</dt><dd>{}</dd>\
              <dt>Roles</dt><dd>{}</dd></dl>\
              {github_action}\
-             <p><a href=\"/admin\">Open admin dashboard</a> · <a href=\"/logout\">Logout</a></p>",
+             <p><a href=\"/admin/identity\">Open Identity administration</a> · <a href=\"/logout\">Logout</a></p>",
             html_escape(profile.steam_id64.as_deref().unwrap_or("unknown")),
             html_escape(profile.display_name.as_deref().unwrap_or("")),
             html_escape(profile.steam_id64.as_deref().unwrap_or("")),
@@ -139,17 +176,15 @@ pub(crate) fn admin_locked_html(current: Option<&CurrentProfile>) -> String {
             html_escape(&display_roles(profile)),
         )
     } else {
-        "<p>The admin dashboard is publicly reachable, but locked. Sign in to check whether your Steam profile has admin access.</p>\
+        "<p>Identity administration is locked. Sign in to check whether your Steam profile has admin access.</p>\
          <p><a href=\"/login\">Login / register</a></p>"
             .to_string()
     };
 
     format!(
-        "<!doctype html><meta charset=\"utf-8\"><title>Vapor Identity Admin</title>\
-         <style>body{{max-width:840px;margin:3rem auto;padding:0 1.5rem;font:16px/1.5 system-ui,sans-serif}}\
-         code{{background:#f4f4f4;padding:.1rem .25rem;border-radius:.2rem}}dt{{font-weight:700}}dd{{margin:0 0 .5rem 0}}</style>\
-         <h1>Vapor Identity Admin</h1>{body}\
-         <p>Admin access requires linked Steam and GitHub identities plus the <code>root</code> role.</p>"
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Vapor Identity</title><link rel=\"stylesheet\" href=\"/admin/assets/admin.css\"><script defer src=\"/admin/assets/admin.js\"></script></head><body><main id=\"admin-content\">\
+         <p class=\"eyebrow\">Identity</p><h1>Accounts and access</h1>{body}\
+         <p>Admin access requires linked Steam and GitHub identities plus the <code>root</code> role.</p></main></body></html>"
     )
 }
 
@@ -241,6 +276,63 @@ pub(crate) fn first_csv(value: Option<&str>) -> Option<String> {
     value
         .and_then(|value| value.split(',').find(|part| !part.trim().is_empty()))
         .map(|value| value.trim().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::same_origin_browser_request;
+    use crate::config::AuthConfig;
+    use axum::http::{HeaderMap, HeaderValue};
+
+    fn config() -> AuthConfig {
+        AuthConfig {
+            steam_app_id: 1,
+            steam_auth_identity: String::new(),
+            steam_web_api_key: None,
+            loocast_app_id: 1,
+            authorization_service_token: None,
+            platform_admin_authorization_service_token: None,
+            artifact_admin_authorization_service_token: None,
+            build_cache_admin_authorization_service_token: None,
+            github_client_id: None,
+            github_client_secret: None,
+            dashboard_password: None,
+            cookie_secure: true,
+            cookie_path: "/".to_owned(),
+            public_origin: Some("https://vapor.example".to_owned()),
+        }
+    }
+
+    #[test]
+    fn admin_form_requires_exact_configured_origin() {
+        let mut headers = HeaderMap::new();
+        headers.insert("origin", HeaderValue::from_static("https://vapor.example"));
+        assert!(same_origin_browser_request(&headers, &config()));
+
+        headers.insert(
+            "origin",
+            HeaderValue::from_static("https://attacker.example"),
+        );
+        assert!(!same_origin_browser_request(&headers, &config()));
+
+        headers.remove("origin");
+        assert!(!same_origin_browser_request(&headers, &config()));
+    }
+
+    #[test]
+    fn admin_form_fails_closed_without_configured_origin() {
+        let mut headers = HeaderMap::new();
+        headers.insert("origin", HeaderValue::from_static("https://vapor.example"));
+        headers.insert("host", HeaderValue::from_static("vapor.example"));
+        headers.insert("x-forwarded-proto", HeaderValue::from_static("https"));
+        headers.insert(
+            "x-forwarded-host",
+            HeaderValue::from_static("vapor.example"),
+        );
+        let mut config = config();
+        config.public_origin = None;
+        assert!(!same_origin_browser_request(&headers, &config));
+    }
 }
 
 pub(crate) fn csv_values(value: &str) -> Vec<String> {

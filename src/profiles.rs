@@ -245,6 +245,34 @@ pub(crate) async fn session_profile_id(
     .await
 }
 
+pub(crate) async fn profile_from_session_token(
+    pool: &SqlitePool,
+    token: &str,
+) -> Result<Option<CurrentProfile>, sqlx::Error> {
+    if token.len() < 32 || token.len() > 256 {
+        return Ok(None);
+    }
+    let token_hash = hash_session_token(token);
+    let now = unix_now_i64();
+    let profile_id = sqlx::query_scalar::<_, String>(
+        "SELECT s.profile_id
+         FROM identity_sessions s
+         JOIN profiles p ON p.id = s.profile_id
+         WHERE s.token_hash = ?
+           AND s.expires_at_unix > ?
+           AND s.revoked_at_unix IS NULL
+           AND p.disabled_at_unix IS NULL",
+    )
+    .bind(token_hash)
+    .bind(now)
+    .fetch_optional(pool)
+    .await?;
+    let Some(profile_id) = profile_id else {
+        return Ok(None);
+    };
+    profile_by_id(pool, &profile_id).await
+}
+
 pub(crate) async fn profile_by_id(
     pool: &SqlitePool,
     profile_id: &str,
