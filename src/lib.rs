@@ -4,6 +4,7 @@ mod auth_attempts;
 mod authorization_handlers;
 mod automation_credentials;
 mod browser_handlers;
+mod cli_authorizations;
 mod config;
 mod db;
 mod entitlements;
@@ -37,6 +38,10 @@ use crate::automation_credentials::{
     verify_automation_credential,
 };
 use crate::browser_handlers::*;
+use crate::cli_authorizations::{
+    approve_ssh_authorization, poll_ssh_authorization, ssh_authorization_page,
+    start_ssh_authorization,
+};
 use crate::config::{read_auth_config, DEFAULT_DB_NAME, DEFAULT_STATE_DIR, MAX_AUTH_BODY_BYTES};
 use crate::db::{open_database, run_migrations};
 use crate::permission_requests::{
@@ -107,6 +112,14 @@ pub async fn routers_from_env() -> Result<HostRouters, Box<dyn std::error::Error
             post(auth_session_github_device_poll),
         )
         .route("/v1/auth/session/finish", post(finish_auth_attempt))
+        .route(
+            "/v1/cli/ssh-authorization/start",
+            post(start_ssh_authorization),
+        )
+        .route(
+            "/v1/cli/ssh-authorization/poll",
+            post(poll_ssh_authorization),
+        )
         .route("/v1/auth/steam/ticket", post(auth_steam_ticket))
         .route("/v1/auth/github/token", post(auth_github_token))
         .route(
@@ -153,6 +166,12 @@ pub async fn routers_from_env() -> Result<HostRouters, Box<dyn std::error::Error
         .route("/login/steam/callback", get(login_steam_callback))
         .route("/login/github", get(login_github_start))
         .route("/login/github/callback", get(login_github_callback))
+        .route(
+            "/cli/ssh/authorize",
+            get(ssh_authorization_page)
+                .post(approve_ssh_authorization)
+                .layer(from_fn(no_store_admin_responses)),
+        )
         .route("/logout", get(logout))
         .route("/admin/identity", get(admin_dashboard))
         .route("/admin/identity/", get(admin_dashboard))

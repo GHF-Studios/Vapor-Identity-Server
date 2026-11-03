@@ -119,7 +119,7 @@ mod tests {
     }
 
     #[test]
-    fn accepts_only_the_named_request_scopes() {
+    fn generic_credentials_exclude_ssh_access_request_scope() {
         let scopes = normalize_scopes(&[
             "identity:role-request:create".to_string(),
             "platform:deploy-request:create".to_string(),
@@ -129,6 +129,7 @@ mod tests {
         assert_eq!(scopes.len(), 2);
         assert!(scopes.contains(&CredentialScope::IdentityRoleRequestCreate));
         assert!(scopes.contains(&CredentialScope::PlatformDeployRequestCreate));
+        assert!(normalize_scopes(&["platform:ssh-access:request".to_string()]).is_err());
     }
 
     #[test]
@@ -375,7 +376,6 @@ fn normalize_scopes(values: &[String]) -> Result<BTreeSet<CredentialScope>, ()> 
         let scope = match value.as_str() {
             "identity:role-request:create" => CredentialScope::IdentityRoleRequestCreate,
             "platform:deploy-request:create" => CredentialScope::PlatformDeployRequestCreate,
-            "platform:ssh-access:request" => CredentialScope::PlatformSshAccessRequestCreate,
             _ => return Err(()),
         };
         if !scopes.insert(scope) {
@@ -393,6 +393,8 @@ pub(crate) fn credential_digest(token: &str) -> String {
 pub(crate) struct RequestCredentialPrincipal {
     pub(crate) credential_id: String,
     pub(crate) actor_profile_id: String,
+    pub(crate) bound_ssh_fingerprint: Option<String>,
+    pub(crate) bound_ssh_request_hash: Option<String>,
 }
 
 pub(crate) fn valid_request_token_format(token: &str) -> bool {
@@ -411,8 +413,10 @@ pub(crate) async fn request_credential_principal(
         return Ok(None);
     }
     let now = unix_now_i64();
+    let mut tx = pool.begin().await?;
     let row = sqlx::query(
-        "SELECT c.id, c.created_by_profile_id, c.scopes
+        "SELECT c.id, c.created_by_profile_id, c.scopes, c.single_use, c.use_count,
+                c.bound_ssh_fingerprint, c.bound_ssh_request_hash
          FROM automation_credentials c
          JOIN profiles p ON p.id = c.created_by_profile_id
          WHERE c.token_hash = ? AND c.expires_at_unix > ? AND c.revoked_at_unix IS NULL
@@ -420,7 +424,7 @@ pub(crate) async fn request_credential_principal(
     )
     .bind(credential_digest(token))
     .bind(now)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await?;
     let Some(row) = row else {
         return Ok(None);
@@ -432,10 +436,41 @@ pub(crate) async fn request_credential_principal(
     {
         return Ok(None);
     }
-    Ok(Some(RequestCredentialPrincipal {
-        credential_id: row.get("id"),
+    let credential_id: String = row.get("id");
+    let single_use: i64 = row.get("single_use");
+    let use_count: i64 = row.get("use_count");
+    let bound_ssh_fingerprint: Option<String> = row.get("bound_ssh_fingerprint");
+    let bound_ssh_request_hash: Option<String> = row.get("bound_ssh_request_hash");
+    if required_scope == CredentialScope::PlatformSshAccessRequestCreate
+        && (single_use == 0 || bound_ssh_fingerprint.is_none() || bound_ssh_request_hash.is_none())
+    {
+        return Ok(None);
+    }
+    if single_use != 0 {
+        if use_count != 0 {
+            return Ok(None);
+        }
+        let consumed = sqlx::query(
+            "UPDATE automation_credentials SET use_count = 1
+             WHERE id = ? AND single_use = 1 AND use_count = 0
+               AND expires_at_unix > ? AND revoked_at_unix IS NULL",
+        )
+        .bind(&credential_id)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+        if consumed.rows_affected() != 1 {
+            return Ok(None);
+        }
+    }
+    let principal = RequestCredentialPrincipal {
+        credential_id,
         actor_profile_id: row.get("created_by_profile_id"),
-    }))
+        bound_ssh_fingerprint,
+        bound_ssh_request_hash,
+    };
+    tx.commit().await?;
+    Ok(Some(principal))
 }
 
 #[derive(Deserialize)]
@@ -479,6 +514,8 @@ pub(crate) struct VerifiedAutomationCredential {
     pub(crate) credential_id: String,
     pub(crate) actor_profile_id: String,
     pub(crate) scope: String,
+    pub(crate) bound_ssh_fingerprint: Option<String>,
+    pub(crate) bound_ssh_request_hash: Option<String>,
 }
 
 pub(crate) async fn create_automation_credential(
@@ -709,6 +746,8 @@ pub(crate) async fn verify_automation_credential(
             credential_id: principal.credential_id,
             actor_profile_id: principal.actor_profile_id,
             scope: request.scope,
+            bound_ssh_fingerprint: principal.bound_ssh_fingerprint,
+            bound_ssh_request_hash: principal.bound_ssh_request_hash,
         }),
     )
         .into_response()

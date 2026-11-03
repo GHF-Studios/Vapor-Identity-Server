@@ -166,6 +166,66 @@ pub(crate) async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error>
     )
     .execute(&mut *tx)
     .await?;
+    let credential_columns = sqlx::query("PRAGMA table_info(automation_credentials)")
+        .fetch_all(&mut *tx)
+        .await?;
+    if !credential_columns
+        .iter()
+        .any(|row| row.get::<String, _>("name") == "single_use")
+    {
+        sqlx::query("ALTER TABLE automation_credentials ADD COLUMN single_use INTEGER NOT NULL DEFAULT 0 CHECK (single_use IN (0, 1))")
+            .execute(&mut *tx)
+            .await?;
+    }
+    if !credential_columns
+        .iter()
+        .any(|row| row.get::<String, _>("name") == "use_count")
+    {
+        sqlx::query("ALTER TABLE automation_credentials ADD COLUMN use_count INTEGER NOT NULL DEFAULT 0 CHECK (use_count >= 0)")
+            .execute(&mut *tx)
+            .await?;
+    }
+    if !credential_columns
+        .iter()
+        .any(|row| row.get::<String, _>("name") == "bound_ssh_fingerprint")
+    {
+        sqlx::query("ALTER TABLE automation_credentials ADD COLUMN bound_ssh_fingerprint TEXT")
+            .execute(&mut *tx)
+            .await?;
+    }
+    if !credential_columns
+        .iter()
+        .any(|row| row.get::<String, _>("name") == "bound_ssh_request_hash")
+    {
+        sqlx::query("ALTER TABLE automation_credentials ADD COLUMN bound_ssh_request_hash TEXT")
+            .execute(&mut *tx)
+            .await?;
+    }
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS cli_ssh_authorizations (
+            id TEXT PRIMARY KEY,
+            device_code_hash TEXT NOT NULL UNIQUE CHECK (length(device_code_hash) = 64),
+            user_code_hash TEXT NOT NULL UNIQUE CHECK (length(user_code_hash) = 64),
+            ssh_fingerprint TEXT NOT NULL,
+            purpose TEXT NOT NULL,
+            capabilities TEXT NOT NULL,
+            requested_duration_seconds INTEGER NOT NULL CHECK (requested_duration_seconds BETWEEN 3600 AND 28800),
+            status TEXT NOT NULL CHECK (status IN ('pending', 'approved', 'denied', 'consumed')),
+            approved_by_profile_id TEXT REFERENCES profiles(id) ON DELETE CASCADE,
+            created_at_unix INTEGER NOT NULL,
+            expires_at_unix INTEGER NOT NULL,
+            last_poll_at_unix INTEGER,
+            consumed_at_unix INTEGER
+        )",
+    )
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_cli_ssh_authorizations_expiry
+         ON cli_ssh_authorizations (status, expires_at_unix)",
+    )
+    .execute(&mut *tx)
+    .await?;
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS permission_requests (
             id TEXT PRIMARY KEY,
@@ -282,6 +342,13 @@ pub(crate) async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error>
     sqlx::query(
         "INSERT OR IGNORE INTO schema_migrations (version, name, applied_at_unix)
          VALUES (7, 'permission_role_state_snapshot', ?)",
+    )
+    .bind(unix_now_i64())
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "INSERT OR IGNORE INTO schema_migrations (version, name, applied_at_unix)
+         VALUES (8, 'one_time_cli_ssh_authorization', ?)",
     )
     .bind(unix_now_i64())
     .execute(&mut *tx)

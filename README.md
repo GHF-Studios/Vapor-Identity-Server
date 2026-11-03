@@ -68,6 +68,8 @@ POST /v1/auth/session/github/token
 POST /v1/auth/session/github/device/start
 POST /v1/auth/session/github/device/poll
 POST /v1/auth/session/finish
+POST /v1/cli/ssh-authorization/start
+POST /v1/cli/ssh-authorization/poll
 POST /v1/auth/steam/ticket
 POST /v1/auth/github/token
 GET  /v1/admin/profiles
@@ -87,6 +89,8 @@ GET  /login/steam
 GET  /login/steam/callback
 GET  /login/github
 GET  /login/github/callback
+GET  /cli/ssh/authorize
+POST /cli/ssh/authorize
 GET  /logout
 GET  /admin/identity
 POST /admin/identity/roles/grant
