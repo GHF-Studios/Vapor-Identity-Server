@@ -198,7 +198,7 @@ pub(crate) async fn ssh_authorization_page(
     );
     response.headers_mut().insert(
         axum::http::header::REFERRER_POLICY,
-        axum::http::HeaderValue::from_static("no-referrer"),
+        axum::http::HeaderValue::from_static("strict-origin"),
     );
     response
 }
