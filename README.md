@@ -162,8 +162,9 @@ The dashboard requires confirmation checkboxes for decisions.
 
 The Identity dashboard creates, lists, and revokes request-only API
 credentials. Their bearer secret appears once on creation; Identity stores only
-its digest. Scopes are limited to `platform:deploy-request:create` and
-`identity:role-request:create`.
+its digest. Scopes are limited to `platform:deploy-request:create`,
+`platform:ssh-access:request`, and `identity:role-request:create`. The SSH scope
+submits access requests only; it cannot approve or activate a grant.
 
 `POST /admin/identity/roles/grant` and `/revoke` are same-origin browser forms
 that create pending requests and require an exact configured Origin.

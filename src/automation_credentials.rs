@@ -352,6 +352,7 @@ const MAX_CREDENTIAL_TTL_SECONDS: i64 = 90 * 24 * 60 * 60;
 pub(crate) enum CredentialScope {
     IdentityRoleRequestCreate,
     PlatformDeployRequestCreate,
+    PlatformSshAccessRequestCreate,
 }
 
 impl CredentialScope {
@@ -359,12 +360,13 @@ impl CredentialScope {
         match self {
             Self::IdentityRoleRequestCreate => "identity:role-request:create",
             Self::PlatformDeployRequestCreate => "platform:deploy-request:create",
+            Self::PlatformSshAccessRequestCreate => "platform:ssh-access:request",
         }
     }
 }
 
 fn normalize_scopes(values: &[String]) -> Result<BTreeSet<CredentialScope>, ()> {
-    if values.is_empty() || values.len() > 2 {
+    if values.is_empty() || values.len() > 3 {
         return Err(());
     }
 
@@ -373,6 +375,7 @@ fn normalize_scopes(values: &[String]) -> Result<BTreeSet<CredentialScope>, ()> 
         let scope = match value.as_str() {
             "identity:role-request:create" => CredentialScope::IdentityRoleRequestCreate,
             "platform:deploy-request:create" => CredentialScope::PlatformDeployRequestCreate,
+            "platform:ssh-access:request" => CredentialScope::PlatformSshAccessRequestCreate,
             _ => return Err(()),
         };
         if !scopes.insert(scope) {
@@ -677,9 +680,16 @@ pub(crate) async fn verify_automation_credential(
     if !crate::util::authorization_service_authorized(&headers, Some(service_token)) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    let expected_scope = match request.audience.as_str() {
-        "vapor-platform-server" => CredentialScope::PlatformDeployRequestCreate,
-        "vapor-identity-server" => CredentialScope::IdentityRoleRequestCreate,
+    let expected_scope = match (request.audience.as_str(), request.scope.as_str()) {
+        ("vapor-platform-server", "platform:deploy-request:create") => {
+            CredentialScope::PlatformDeployRequestCreate
+        }
+        ("vapor-platform-server", "platform:ssh-access:request") => {
+            CredentialScope::PlatformSshAccessRequestCreate
+        }
+        ("vapor-identity-server", "identity:role-request:create") => {
+            CredentialScope::IdentityRoleRequestCreate
+        }
         _ => return StatusCode::BAD_REQUEST.into_response(),
     };
     if request.scope != expected_scope.as_str() {
