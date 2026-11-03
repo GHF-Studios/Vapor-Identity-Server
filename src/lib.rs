@@ -52,10 +52,7 @@ pub struct HostRouters {
 
 pub async fn app_router_from_env() -> Result<Router, Box<dyn std::error::Error>> {
     let routers = routers_from_env().await?;
-    Ok(Router::new()
-        .route("/healthz", get(healthz))
-        .merge(routers.api)
-        .merge(routers.web))
+    Ok(Router::new().merge(routers.api).merge(routers.web))
 }
 
 pub async fn routers_from_env() -> Result<HostRouters, Box<dyn std::error::Error>> {
@@ -89,6 +86,7 @@ pub async fn routers_from_env() -> Result<HostRouters, Box<dyn std::error::Error
         http,
     };
     let api = Router::new()
+        .route("/healthz", get(healthz))
         .route("/v1/status", get(status))
         .route("/v1/auth/status", get(auth_status))
         .route("/v1/auth/session/start", post(start_auth_attempt))
