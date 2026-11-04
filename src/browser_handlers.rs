@@ -14,7 +14,11 @@ pub(crate) struct AutomationCredentialForm {
     label: String,
     expires_in_days: i64,
     #[serde(default)]
-    scopes: Vec<String>,
+    platform_deploy_requests: bool,
+    #[serde(default)]
+    platform_ssh_access_requests: bool,
+    #[serde(default)]
+    identity_role_requests: bool,
 }
 
 use crate::automation_credentials::{
@@ -521,7 +525,7 @@ pub(crate) async fn admin_dashboard(
          <p>This form requires your root dashboard session. It still refuses grants unless the SteamID64 and GitHub login are already linked to the same profile.</p>\
          <p>Root implies content-developer. To demote a root profile to developer, first grant <code>content-developer</code>, then revoke <code>root</code>.</p>\
          <h2>Permission requests</h2><p>Role changes remain pending until approved here by a root session.</p><table><thead><tr><th>Request</th><th>Action</th><th>Role</th><th>Subject</th><th>Created</th><th>Expires</th><th>Decision</th></tr></thead><tbody>{permission_requests}</tbody></table>\
-         <h2>Automation request credentials</h2><p>These credentials can submit only the selected request types. Copy the secret from the one-time creation response; it is not stored or shown again.</p><form method=\"post\" action=\"/admin/identity/automation-credentials\"><label>Label <input name=\"label\" maxlength=\"80\" required></label><label>Expires in days <input name=\"expires_in_days\" type=\"number\" min=\"1\" max=\"90\" value=\"30\" required></label><label><input type=\"checkbox\" name=\"scopes\" value=\"platform:deploy-request:create\"> Create Platform deploy requests</label><label><input type=\"checkbox\" name=\"scopes\" value=\"platform:ssh-access:request\"> Request temporary Platform SSH access</label><label><input type=\"checkbox\" name=\"scopes\" value=\"identity:role-request:create\"> Create Identity role requests</label><button type=\"submit\">Create request credential</button></form><table><thead><tr><th>Label</th><th>Scopes</th><th>Created</th><th>Expires</th><th>Status</th><th>Action</th></tr></thead><tbody>{credentials}</tbody></table>\
+         <h2>Automation request credentials</h2><p>These credentials can submit only the selected request types. Copy the secret from the one-time creation response; it is not stored or shown again.</p><form method=\"post\" action=\"/admin/identity/automation-credentials\"><label>Label <input name=\"label\" maxlength=\"80\" required></label><label>Expires in days <input name=\"expires_in_days\" type=\"number\" min=\"1\" max=\"90\" value=\"30\" required></label><label><input type=\"checkbox\" name=\"platform_deploy_requests\" value=\"true\"> Create Platform deploy requests</label><label><input type=\"checkbox\" name=\"platform_ssh_access_requests\" value=\"true\"> Request temporary Platform SSH access</label><label><input type=\"checkbox\" name=\"identity_role_requests\" value=\"true\"> Create Identity role requests</label><button type=\"submit\">Create request credential</button></form><table><thead><tr><th>Label</th><th>Scopes</th><th>Created</th><th>Expires</th><th>Status</th><th>Action</th></tr></thead><tbody>{credentials}</tbody></table>\
          <h2>Profiles</h2><table><thead><tr><th>Name</th><th>Steam</th><th>GitHub</th><th>Effective roles</th><th>Actions</th></tr></thead><tbody>{rows}</tbody></table>\
          <h2>Recent audit events</h2><table><thead><tr><th>ID</th><th>Unix time</th><th>Event</th><th>Actor</th><th>Subject</th><th>Detail</th></tr></thead><tbody>{audit}</tbody></table></main></body></html>",
         html_escape(current.steam_id64.as_deref().unwrap_or("unknown")),
@@ -727,10 +731,20 @@ pub(crate) async fn admin_create_automation_credential_form(
             "/admin/identity?error=credential%20expiry%20must%20be%201%20to%2090%20days",
         );
     }
+    let mut scopes = Vec::new();
+    if form.platform_deploy_requests {
+        scopes.push("platform:deploy-request:create".to_string());
+    }
+    if form.platform_ssh_access_requests {
+        scopes.push("platform:ssh-access:request".to_string());
+    }
+    if form.identity_role_requests {
+        scopes.push("identity:role-request:create".to_string());
+    }
     let request = CreateAutomationCredentialRequest {
         label: form.label,
         expires_at_unix: unix_now_i64() + form.expires_in_days * 24 * 60 * 60,
-        scopes: form.scopes,
+        scopes,
     };
     let response = create_automation_credential(State(state), headers, Json(request)).await;
     if response.status() != StatusCode::CREATED {
@@ -859,5 +873,32 @@ fn external_identity_label(steam_ids: Option<&str>, github_logins: Option<&str>)
         (false, true) => format!("Steam {steam}"),
         (true, false) => format!("GitHub {github}"),
         (false, false) => format!("Steam {steam} / GitHub {github}"),
+    }
+}
+
+#[cfg(test)]
+mod automation_credential_form_tests {
+    use super::AutomationCredentialForm;
+
+    #[test]
+    fn one_checked_permission_deserializes_without_a_list_shape() {
+        let form: AutomationCredentialForm = serde_urlencoded::from_str(
+            "label=Platform+deploy+requests&expires_in_days=30&platform_deploy_requests=true",
+        )
+        .unwrap();
+
+        assert!(form.platform_deploy_requests);
+        assert!(!form.platform_ssh_access_requests);
+        assert!(!form.identity_role_requests);
+    }
+
+    #[test]
+    fn unchecked_permissions_default_to_false() {
+        let form: AutomationCredentialForm =
+            serde_urlencoded::from_str("label=Test&expires_in_days=30").unwrap();
+
+        assert!(!form.platform_deploy_requests);
+        assert!(!form.platform_ssh_access_requests);
+        assert!(!form.identity_role_requests);
     }
 }
