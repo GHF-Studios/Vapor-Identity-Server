@@ -1,4 +1,4 @@
-use axum::http::header::{AUTHORIZATION, COOKIE, LOCATION, SET_COOKIE};
+use axum::http::header::{AUTHORIZATION, CACHE_CONTROL, COOKIE, LOCATION, SET_COOKIE};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use serde_json::Value;
@@ -197,27 +197,122 @@ pub(crate) fn display_roles(profile: &CurrentProfile) -> String {
 }
 
 pub(crate) fn redirect_response(location: &str) -> Response {
-    (
+    let mut response = (
         StatusCode::SEE_OTHER,
         [(LOCATION, location.to_string())],
         "",
     )
-        .into_response()
+        .into_response();
+    response.headers_mut().insert(
+        CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    response
 }
 
 pub(crate) fn redirect_with_cookie(config: &AuthConfig, location: &str, token: &str) -> Response {
-    (
-        StatusCode::SEE_OTHER,
-        [
-            (
-                SET_COOKIE,
-                session_cookie(config, token, DASHBOARD_SESSION_TTL_SECONDS),
-            ),
-            (LOCATION, location.to_string()),
-        ],
-        "",
-    )
-        .into_response()
+    let mut response = redirect_response(location);
+    if let Ok(value) = axum::http::HeaderValue::from_str(&session_cookie(
+        config,
+        token,
+        DASHBOARD_SESSION_TTL_SECONDS,
+    )) {
+        response.headers_mut().append(SET_COOKIE, value);
+    }
+    response
+}
+
+pub(crate) fn browser_login_state_matches(
+    headers: &HeaderMap,
+    flow: &str,
+    expected_state: &str,
+) -> bool {
+    let Some((cookie_name, _)) = browser_login_cookie(flow) else {
+        return false;
+    };
+    let mut state_cookie_value = None;
+    for cookie_header in headers.get_all(COOKIE).iter() {
+        let Ok(cookie_header) = cookie_header.to_str() else {
+            return false;
+        };
+        for part in cookie_header.split(';') {
+            let Some((name, value)) = part.trim().split_once('=') else {
+                continue;
+            };
+            if name == cookie_name {
+                if state_cookie_value.is_some() {
+                    return false;
+                }
+                state_cookie_value = Some(value);
+            }
+        }
+    }
+    state_cookie_value == Some(expected_state)
+}
+
+pub(crate) fn redirect_with_login_state_cookie(
+    config: &AuthConfig,
+    location: &str,
+    flow: &str,
+    state: &str,
+) -> Response {
+    let Some((cookie_name, callback_path)) = browser_login_cookie(flow) else {
+        return redirect_response(location);
+    };
+    let secure = if config.cookie_secure { "; Secure" } else { "" };
+    let cookie = format!(
+        "{cookie_name}={state}; Path={callback_path}; Max-Age={}; HttpOnly; SameSite=Lax{secure}",
+        crate::config::BROWSER_LOGIN_ATTEMPT_TTL_SECONDS
+    );
+    let mut response = redirect_response(location);
+    if let Ok(value) = axum::http::HeaderValue::from_str(&cookie) {
+        response.headers_mut().append(SET_COOKIE, value);
+    }
+    response
+}
+
+pub(crate) fn redirect_with_cookie_and_clear_login_state(
+    config: &AuthConfig,
+    location: &str,
+    token: &str,
+    flow: &str,
+) -> Response {
+    let mut response = redirect_with_cookie(config, location, token);
+    append_clear_login_state_cookie(&mut response, config, flow);
+    response
+}
+
+pub(crate) fn redirect_with_clear_login_state(
+    config: &AuthConfig,
+    location: &str,
+    flow: &str,
+) -> Response {
+    let mut response = redirect_response(location);
+    append_clear_login_state_cookie(&mut response, config, flow);
+    response
+}
+
+fn append_clear_login_state_cookie(response: &mut Response, config: &AuthConfig, flow: &str) {
+    if let Some((cookie_name, callback_path)) = browser_login_cookie(flow) {
+        let secure = if config.cookie_secure { "; Secure" } else { "" };
+        let cookie = format!(
+            "{cookie_name}=; Path={callback_path}; Max-Age=0; HttpOnly; SameSite=Lax{secure}"
+        );
+        if let Ok(value) = axum::http::HeaderValue::from_str(&cookie) {
+            response.headers_mut().append(SET_COOKIE, value);
+        }
+    }
+}
+
+fn browser_login_cookie(flow: &str) -> Option<(&'static str, &'static str)> {
+    match flow {
+        "steam" => Some(("vapor_identity_steam_login_state", "/login/steam/callback")),
+        "github" => Some((
+            "vapor_identity_github_login_state",
+            "/login/github/callback",
+        )),
+        _ => None,
+    }
 }
 
 pub(crate) fn public_origin(config: &AuthConfig, headers: &HeaderMap) -> String {
@@ -280,9 +375,12 @@ pub(crate) fn first_csv(value: Option<&str>) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::same_origin_browser_request;
+    use super::{
+        browser_login_state_matches, redirect_with_cookie, redirect_with_login_state_cookie,
+        same_origin_browser_request,
+    };
     use crate::config::AuthConfig;
-    use axum::http::{HeaderMap, HeaderValue};
+    use axum::http::{HeaderMap, HeaderValue, StatusCode};
 
     fn config() -> AuthConfig {
         AuthConfig {
@@ -332,6 +430,95 @@ mod tests {
         let mut config = config();
         config.public_origin = None;
         assert!(!same_origin_browser_request(&headers, &config));
+    }
+
+    #[test]
+    fn browser_login_state_must_match_the_flow_specific_cookie() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "cookie",
+            HeaderValue::from_static("vapor_identity_steam_login_state=login-state-1; other=value"),
+        );
+
+        assert!(browser_login_state_matches(
+            &headers,
+            "steam",
+            "login-state-1"
+        ));
+        assert!(!browser_login_state_matches(
+            &headers,
+            "steam",
+            "login-state-2"
+        ));
+        assert!(!browser_login_state_matches(
+            &headers,
+            "github",
+            "login-state-1"
+        ));
+        assert!(!browser_login_state_matches(
+            &HeaderMap::new(),
+            "steam",
+            "login-state-1"
+        ));
+    }
+
+    #[test]
+    fn duplicate_browser_state_cookies_are_rejected() {
+        let mut headers = HeaderMap::new();
+        headers.append(
+            "cookie",
+            HeaderValue::from_static("vapor_identity_steam_login_state=login-state-1"),
+        );
+        headers.append(
+            "cookie",
+            HeaderValue::from_static("vapor_identity_steam_login_state=login-state-2"),
+        );
+
+        assert!(!browser_login_state_matches(
+            &headers,
+            "steam",
+            "login-state-1"
+        ));
+    }
+
+    #[test]
+    fn browser_login_redirect_sets_a_private_flow_scoped_cookie() {
+        let response = redirect_with_login_state_cookie(
+            &config(),
+            "https://steamcommunity.com/openid/login?state=login-state-1",
+            "steam",
+            "login-state-1",
+        );
+
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(response.headers().get("cache-control").unwrap(), "no-store");
+        let cookie = response
+            .headers()
+            .get_all("set-cookie")
+            .iter()
+            .next()
+            .unwrap();
+        let cookie = cookie.to_str().unwrap();
+        assert!(cookie.contains("Path=/login/steam/callback"));
+        assert!(cookie.contains("HttpOnly"));
+        assert!(cookie.contains("SameSite=Lax"));
+        assert!(cookie.contains("Secure"));
+    }
+
+    #[test]
+    fn session_redirect_sets_a_private_no_store_cookie() {
+        let response = redirect_with_cookie(&config(), "/login", "session-token");
+
+        assert_eq!(response.headers().get("cache-control").unwrap(), "no-store");
+        let cookie = response
+            .headers()
+            .get("set-cookie")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(cookie.starts_with("vapor_identity_session=session-token;"));
+        assert!(cookie.contains("HttpOnly"));
+        assert!(cookie.contains("SameSite=Lax"));
     }
 }
 

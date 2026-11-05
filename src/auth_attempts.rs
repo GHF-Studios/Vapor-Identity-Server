@@ -55,16 +55,92 @@ pub(crate) async fn browser_login_attempt(
     }))
 }
 
-pub(crate) async fn consume_browser_login_attempt(
+pub(crate) async fn claim_browser_login_attempt(
     pool: &SqlitePool,
     state: &str,
-) -> Result<(), sqlx::Error> {
-    sqlx::query("UPDATE browser_login_attempts SET consumed_at_unix = ? WHERE state = ?")
-        .bind(unix_now_i64())
-        .bind(state)
-        .execute(pool)
-        .await?;
-    Ok(())
+    flow: &str,
+) -> Result<bool, sqlx::Error> {
+    let now = unix_now_i64();
+    let result = sqlx::query(
+        "UPDATE browser_login_attempts SET consumed_at_unix = ?
+         WHERE state = ? AND flow = ? AND expires_at_unix > ? AND consumed_at_unix IS NULL",
+    )
+    .bind(now)
+    .bind(state)
+    .bind(flow)
+    .bind(now)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() == 1)
+}
+
+#[cfg(test)]
+mod browser_login_claim_tests {
+    use super::*;
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    async fn pool_with_attempt(expires_at_unix: i64) -> SqlitePool {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE browser_login_attempts (
+                state TEXT PRIMARY KEY,
+                flow TEXT NOT NULL,
+                profile_id TEXT,
+                created_at_unix INTEGER NOT NULL,
+                expires_at_unix INTEGER NOT NULL,
+                consumed_at_unix INTEGER
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO browser_login_attempts
+             (state, flow, created_at_unix, expires_at_unix)
+             VALUES ('login-test-state', 'steam', 1, ?)",
+        )
+        .bind(expires_at_unix)
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool
+    }
+
+    #[tokio::test]
+    async fn browser_login_state_can_be_claimed_only_once_for_its_flow() {
+        let pool = pool_with_attempt(unix_now_i64() + 60).await;
+
+        assert!(
+            !claim_browser_login_attempt(&pool, "login-test-state", "github")
+                .await
+                .unwrap()
+        );
+        assert!(
+            claim_browser_login_attempt(&pool, "login-test-state", "steam")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !claim_browser_login_attempt(&pool, "login-test-state", "steam")
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_browser_login_state_cannot_be_claimed() {
+        let pool = pool_with_attempt(unix_now_i64() - 1).await;
+
+        assert!(
+            !claim_browser_login_attempt(&pool, "login-test-state", "steam")
+                .await
+                .unwrap()
+        );
+    }
 }
 
 pub(crate) async fn create_auth_attempt(

@@ -30,7 +30,6 @@ pub(crate) struct GitHubCallbackQuery {
     pub(crate) code: Option<String>,
     pub(crate) state: Option<String>,
     pub(crate) error: Option<String>,
-    pub(crate) error_description: Option<String>,
 }
 
 #[derive(Deserialize)]

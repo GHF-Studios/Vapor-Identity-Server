@@ -74,9 +74,7 @@ pub async fn routers_from_env() -> Result<HostRouters, Box<dyn std::error::Error
     let pool = open_database(&db_path).await?;
     run_migrations(&pool).await?;
     let config = Arc::new(read_auth_config());
-    let http = reqwest::Client::builder()
-        .user_agent("Vapor-Identity-Server/0.1")
-        .build()?;
+    let http = crate::providers::provider_http_client()?;
 
     let state = AppState {
         pool,

@@ -99,9 +99,32 @@ fn valid_service_token(value: &str) -> bool {
 }
 
 fn valid_public_origin(value: &str) -> bool {
-    (value.starts_with("http://") || value.starts_with("https://"))
-        && !value.ends_with('/')
-        && !value.contains(';')
-        && !value.contains('\r')
-        && !value.contains('\n')
+    let Ok(url) = reqwest::Url::parse(value) else {
+        return false;
+    };
+    matches!(url.scheme(), "http" | "https")
+        && url.host_str().is_some()
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.path() == "/"
+        && url.query().is_none()
+        && url.fragment().is_none()
+        && url.as_str().strip_suffix('/') == Some(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::valid_public_origin;
+
+    #[test]
+    fn public_origin_accepts_only_canonical_bare_http_origins() {
+        assert!(valid_public_origin("https://vapor.example"));
+        assert!(valid_public_origin("http://localhost:7113"));
+        assert!(!valid_public_origin("https://vapor.example/"));
+        assert!(!valid_public_origin("https://vapor.example/admin"));
+        assert!(!valid_public_origin("https://vapor.example?next=/admin"));
+        assert!(!valid_public_origin("https://vapor.example#fragment"));
+        assert!(!valid_public_origin("https://user@vapor.example"));
+        assert!(!valid_public_origin("file://vapor.example"));
+    }
 }

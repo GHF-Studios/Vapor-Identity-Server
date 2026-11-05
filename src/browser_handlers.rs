@@ -35,10 +35,11 @@ use crate::persistence::*;
 use crate::providers::{exchange_github_web_code, verify_github_access_token, verify_steam_openid};
 use crate::types::*;
 use crate::util::{
-    admin_locked_html, expired_session_cookie, github_browser_ready, html_escape, login_html,
-    new_browser_login_state, percent_encode, public_origin, redirect_response,
-    redirect_with_cookie, same_origin_browser_request, session_token_from_headers, text_response,
-    unix_now_i64, valid_browser_state,
+    admin_locked_html, browser_login_state_matches, expired_session_cookie, github_browser_ready,
+    html_escape, login_html, new_browser_login_state, percent_encode, public_origin,
+    redirect_response, redirect_with_clear_login_state, redirect_with_cookie_and_clear_login_state,
+    redirect_with_login_state_cookie, same_origin_browser_request, session_token_from_headers,
+    text_response, unix_now_i64, valid_browser_state,
 };
 
 pub(crate) async fn login_page(
@@ -92,7 +93,7 @@ pub(crate) async fn login_steam_start(
         percent_encode(&format!("{origin}/")),
     );
 
-    redirect_response(&redirect)
+    redirect_with_login_state_cookie(&state.config, &redirect, "steam", &state_token)
 }
 
 pub(crate) async fn login_steam_callback(
@@ -109,6 +110,12 @@ pub(crate) async fn login_steam_callback(
             "identity: missing or invalid state",
         );
     };
+    if !browser_login_state_matches(&headers, "steam", state_token) {
+        return text_response(
+            StatusCode::UNAUTHORIZED,
+            "identity: Steam login state does not match this browser",
+        );
+    }
     match browser_login_attempt(&state.pool, state_token, "steam").await {
         Ok(Some(_attempt)) => {}
         Ok(None) => {
@@ -141,6 +148,21 @@ pub(crate) async fn login_steam_callback(
         Ok(steam_id64) => steam_id64,
         Err(response) => return response,
     };
+    match claim_browser_login_attempt(&state.pool, state_token, "steam").await {
+        Ok(true) => {}
+        Ok(false) => {
+            return text_response(
+                StatusCode::CONFLICT,
+                "identity: Steam login attempt was already used or expired",
+            );
+        }
+        Err(error) => {
+            return text_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("identity: failed to claim Steam login attempt: {error}"),
+            );
+        }
+    }
     let profile_id = match link_steam_account(&state.pool, &steam_id64).await {
         Ok(profile_id) => profile_id,
         Err(error) => {
@@ -160,14 +182,7 @@ pub(crate) async fn login_steam_callback(
                 );
             }
         };
-    if let Err(error) = consume_browser_login_attempt(&state.pool, state_token).await {
-        return text_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("identity: failed to consume Steam login attempt: {error}"),
-        );
-    }
-
-    redirect_with_cookie(&state.config, "/login", &token)
+    redirect_with_cookie_and_clear_login_state(&state.config, "/login", &token, "steam")
 }
 
 pub(crate) async fn login_github_start(
@@ -223,7 +238,7 @@ pub(crate) async fn login_github_start(
         percent_encode("read:user"),
         percent_encode(&state_token),
     );
-    redirect_response(&redirect)
+    redirect_with_login_state_cookie(&state.config, &redirect, "github", &state_token)
 }
 
 pub(crate) async fn login_github_callback(
@@ -231,14 +246,17 @@ pub(crate) async fn login_github_callback(
     headers: HeaderMap,
     Query(query): Query<GitHubCallbackQuery>,
 ) -> Response {
-    if let Some(error) = query.error.as_deref() {
-        let detail = query.error_description.as_deref().unwrap_or(error);
+    if query.error.is_some() {
         return text_response(
             StatusCode::UNAUTHORIZED,
-            &format!("identity: GitHub authorization failed: {detail}"),
+            "identity: GitHub authorization failed",
         );
     }
-    let Some(code) = query.code.as_deref().filter(|value| !value.is_empty()) else {
+    let Some(code) = query
+        .code
+        .as_deref()
+        .filter(|value| !value.is_empty() && value.len() <= 2048)
+    else {
         return text_response(StatusCode::BAD_REQUEST, "identity: missing GitHub code");
     };
     let Some(state_token) = query
@@ -251,6 +269,12 @@ pub(crate) async fn login_github_callback(
             "identity: missing or invalid state",
         );
     };
+    if !browser_login_state_matches(&headers, "github", state_token) {
+        return text_response(
+            StatusCode::UNAUTHORIZED,
+            "identity: GitHub login state does not match this browser",
+        );
+    }
     let Some(client_id) = state.config.github_client_id.as_deref() else {
         return text_response(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -311,6 +335,21 @@ pub(crate) async fn login_github_callback(
         Err(response) => return response,
     };
     let display_name = user.name.as_deref().unwrap_or(&user.login);
+    match claim_browser_login_attempt(&state.pool, state_token, "github").await {
+        Ok(true) => {}
+        Ok(false) => {
+            return text_response(
+                StatusCode::CONFLICT,
+                "identity: GitHub login attempt was already used or expired",
+            );
+        }
+        Err(error) => {
+            return text_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("identity: failed to claim GitHub login attempt: {error}"),
+            );
+        }
+    }
     if let Err(error) =
         link_github_account_to_profile(&state.pool, &profile_id, &user, display_name).await
     {
@@ -319,14 +358,7 @@ pub(crate) async fn login_github_callback(
             &format!("identity: failed to link GitHub identity: {error}"),
         );
     }
-    if let Err(error) = consume_browser_login_attempt(&state.pool, state_token).await {
-        return text_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("identity: failed to consume GitHub login attempt: {error}"),
-        );
-    }
-
-    redirect_response("/login")
+    redirect_with_clear_login_state(&state.config, "/login", "github")
 }
 
 pub(crate) async fn logout(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
