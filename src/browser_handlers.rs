@@ -422,9 +422,10 @@ pub(crate) async fn admin_dashboard(
         }
     };
     let request_rows = match sqlx::query(
-        "SELECT id, action, role, steam_id64, github_login, version, created_at_unix, expires_at_unix
-         FROM permission_requests WHERE status = 'pending' ORDER BY created_at_unix LIMIT 200",
+        "SELECT id, requester_profile_id, action, role, steam_id64, github_login, version, created_at_unix, expires_at_unix
+         FROM permission_requests WHERE status = 'pending' AND expires_at_unix > ? ORDER BY created_at_unix DESC LIMIT 200",
     )
+    .bind(unix_now_i64())
     .fetch_all(&state.pool)
     .await
     {
@@ -478,19 +479,69 @@ pub(crate) async fn admin_dashboard(
         let id: String = row.get("id");
         let version: i64 = row.get("version");
         permission_requests.push_str(&format!(
-            "<tr><td><code>{}</code></td><td>{}</td><td>{}</td><td>Steam {} / GitHub {}</td><td>{}</td><td>{}</td><td><form class=\"inline\" method=\"post\" action=\"/admin/identity/permission-requests/{}/approve\"><input type=\"hidden\" name=\"expected_version\" value=\"{}\"><label><input type=\"checkbox\" name=\"confirmed\" value=\"true\" required> confirm</label><button type=\"submit\">Approve</button></form><form class=\"inline\" method=\"post\" action=\"/admin/identity/permission-requests/{}/reject\"><input type=\"hidden\" name=\"expected_version\" value=\"{}\"><input type=\"hidden\" name=\"reason\" value=\"Rejected by root administrator\"><label><input type=\"checkbox\" name=\"confirmed\" value=\"true\" required> confirm</label><button type=\"submit\">Reject</button></form></td></tr>",
+            "<tr><td><code>{}</code></td><td><code>{}</code></td><td>{}</td><td>{}</td><td>Steam {} / GitHub {}</td><td>{}</td><td>{}</td><td><form class=\"inline\" method=\"post\" action=\"/admin/identity/permission-requests/{}/approve\"><input type=\"hidden\" name=\"expected_version\" value=\"{}\"><label><input type=\"checkbox\" name=\"confirmed\" value=\"true\" required> confirm</label><button type=\"submit\">Approve</button></form><form class=\"inline\" method=\"post\" action=\"/admin/identity/permission-requests/{}/reject\"><input type=\"hidden\" name=\"expected_version\" value=\"{}\"><input type=\"hidden\" name=\"reason\" value=\"Rejected by root administrator\"><label><input type=\"checkbox\" name=\"confirmed\" value=\"true\" required> confirm</label><button type=\"submit\">Reject</button></form></td></tr>",
             html_escape(&id),
+            html_escape(row.get::<String, _>("requester_profile_id").as_str()),
             html_escape(row.get::<String, _>("action").as_str()),
             html_escape(row.get::<String, _>("role").as_str()),
             html_escape(row.get::<String, _>("steam_id64").as_str()),
             html_escape(row.get::<String, _>("github_login").as_str()),
-            row.get::<i64, _>("created_at_unix"),
-            row.get::<i64, _>("expires_at_unix"),
+            dashboard_time(row.get::<i64, _>("created_at_unix")),
+            dashboard_time(row.get::<i64, _>("expires_at_unix")),
             html_escape(&id), version, html_escape(&id), version
         ));
     }
     if permission_requests.is_empty() {
-        permission_requests.push_str("<tr><td colspan=\"7\">No pending requests.</td></tr>");
+        permission_requests.push_str("<tr><td colspan=\"8\">No pending requests.</td></tr>");
+    }
+    let history_rows = match sqlx::query(
+        "SELECT id, requester_profile_id, action, role, steam_id64, github_login, status, created_at_unix,
+                expires_at_unix, decided_at_unix, decision_reason
+         FROM permission_requests WHERE status != 'pending' OR (status = 'pending' AND expires_at_unix <= ?)
+         ORDER BY COALESCE(decided_at_unix, created_at_unix) DESC LIMIT 200",
+    )
+    .bind(unix_now_i64())
+    .fetch_all(&state.pool)
+    .await
+    {
+        Ok(rows) => rows,
+        Err(_) => {
+            return admin_text_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "identity: failed to load permission request history",
+            )
+        }
+    };
+    let mut permission_history = String::new();
+    for row in history_rows {
+        let created_at = row.get::<i64, _>("created_at_unix");
+        let decided_at = row.get::<Option<i64>, _>("decided_at_unix");
+        let stored_status: String = row.get("status");
+        let status = if stored_status == "pending" {
+            "expired · Identity transition pending"
+        } else {
+            stored_status.as_str()
+        };
+        permission_history.push_str(&format!(
+            "<tr><td><code>{}</code></td><td><code>{}</code></td><td>{}</td><td>{}</td><td>{}</td><td>Steam {} / GitHub {}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+            html_escape(row.get::<String, _>("id").as_str()),
+            html_escape(row.get::<String, _>("requester_profile_id").as_str()),
+            html_escape(status),
+            html_escape(row.get::<String, _>("action").as_str()),
+            html_escape(row.get::<String, _>("role").as_str()),
+            html_escape(row.get::<String, _>("steam_id64").as_str()),
+            html_escape(row.get::<String, _>("github_login").as_str()),
+            dashboard_time(created_at),
+            dashboard_time(row.get::<i64, _>("expires_at_unix")),
+            decided_at
+                .map(dashboard_time)
+                .unwrap_or_else(|| "—".to_string()),
+            html_escape(row.get::<Option<String>, _>("decision_reason").as_deref().unwrap_or(""))
+        ));
+    }
+    if permission_history.is_empty() {
+        permission_history
+            .push_str("<tr><td colspan=\"10\">No past permission requests.</td></tr>");
     }
     let mut rows = String::new();
     for row in profile_rows {
@@ -511,7 +562,7 @@ pub(crate) async fn admin_dashboard(
         audit.push_str(&format!(
             "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
             row.event_id,
-            row.created_at_unix,
+            dashboard_time(row.created_at_unix),
             html_escape(&row.event_type),
             html_escape(&external_identity_label(
                 row.actor_steam_ids.as_deref(),
@@ -556,13 +607,18 @@ pub(crate) async fn admin_dashboard(
          <button type=\"submit\">Grant role</button></form>\
          <p>This form requires your root dashboard session. It still refuses grants unless the SteamID64 and GitHub login are already linked to the same profile.</p>\
          <p>Root implies content-developer. To demote a root profile to developer, first grant <code>content-developer</code>, then revoke <code>root</code>.</p>\
-         <h2>Permission requests</h2><p>Role changes remain pending until approved here by a root session.</p><table><thead><tr><th>Request</th><th>Action</th><th>Role</th><th>Subject</th><th>Created</th><th>Expires</th><th>Decision</th></tr></thead><tbody>{permission_requests}</tbody></table>\
+         <h2>Pending permission requests</h2><p>Role changes remain pending until approved here by a root session.</p><div class=\"table-scroll\"><table><thead><tr><th>Request</th><th>Requester profile</th><th>Action</th><th>Role</th><th>Subject</th><th>Created</th><th>Expires</th><th>Decision</th></tr></thead><tbody>{permission_requests}</tbody></table></div>\
+         <h2>Past permission requests</h2><p class=\"muted\">Read-only decisions, persisted expirations, and overdue pending requests. Overdue rows are labeled while Identity's stored transition remains pending; they are not actionable here.</p><div class=\"table-scroll\"><table><thead><tr><th>Request</th><th>Requester profile</th><th>Status</th><th>Action</th><th>Role</th><th>Subject</th><th>Created</th><th>Expires</th><th>Decided</th><th>Decision reason</th></tr></thead><tbody>{permission_history}</tbody></table></div>\
          <h2>Automation request credentials</h2><p>These credentials can submit only the selected request types. Copy the secret from the one-time creation response; it is not stored or shown again.</p><form method=\"post\" action=\"/admin/identity/automation-credentials\"><label>Label <input name=\"label\" maxlength=\"80\" required></label><label>Expires in days <input name=\"expires_in_days\" type=\"number\" min=\"1\" max=\"90\" value=\"30\" required></label><label><input type=\"checkbox\" name=\"platform_deploy_requests\" value=\"true\"> Create Platform deploy requests</label><label><input type=\"checkbox\" name=\"platform_ssh_access_requests\" value=\"true\"> Request temporary Platform SSH access</label><label><input type=\"checkbox\" name=\"identity_role_requests\" value=\"true\"> Create Identity role requests</label><button type=\"submit\">Create request credential</button></form><table><thead><tr><th>Label</th><th>Scopes</th><th>Created</th><th>Expires</th><th>Status</th><th>Action</th></tr></thead><tbody>{credentials}</tbody></table>\
          <h2>Profiles</h2><table><thead><tr><th>Name</th><th>Steam</th><th>GitHub</th><th>Effective roles</th><th>Actions</th></tr></thead><tbody>{rows}</tbody></table>\
-         <h2>Recent audit events</h2><table><thead><tr><th>ID</th><th>Unix time</th><th>Event</th><th>Actor</th><th>Subject</th><th>Detail</th></tr></thead><tbody>{audit}</tbody></table></main></body></html>",
+         <h2>Recent audit events</h2><table><thead><tr><th>ID</th><th>Time</th><th>Event</th><th>Actor</th><th>Subject</th><th>Detail</th></tr></thead><tbody>{audit}</tbody></table></main></body></html>",
         html_escape(current.steam_id64.as_deref().unwrap_or("unknown")),
         github_browser_ready(&state.config)
     ))
+}
+
+fn dashboard_time(timestamp: i64) -> String {
+    format!("<time data-unix=\"{timestamp}\">{timestamp}</time>")
 }
 
 fn admin_html_response(body: String) -> Response {

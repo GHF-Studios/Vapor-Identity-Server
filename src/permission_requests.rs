@@ -54,6 +54,8 @@ struct PermissionRequestCreated {
 #[derive(Serialize)]
 struct PermissionRequestSummary {
     id: String,
+    requester_profile_id: String,
+    requester_kind: String,
     action: String,
     role: String,
     steam_id64: String,
@@ -207,7 +209,7 @@ pub(crate) async fn list_permission_requests(
     }
     let query = if let Some(credential) = &actor.credential {
         sqlx::query(
-            "SELECT id, action, role, steam_id64, github_login, status, version,
+            "SELECT id, requester_profile_id, requester_credential_id, action, role, steam_id64, github_login, status, version,
                     created_at_unix, expires_at_unix, decided_at_unix, decision_reason
              FROM permission_requests WHERE requester_credential_id = ?
              ORDER BY created_at_unix DESC LIMIT 200",
@@ -220,7 +222,7 @@ pub(crate) async fn list_permission_requests(
             Err(response) => return response,
         }
         sqlx::query(
-            "SELECT id, action, role, steam_id64, github_login, status, version,
+            "SELECT id, requester_profile_id, requester_credential_id, action, role, steam_id64, github_login, status, version,
                     created_at_unix, expires_at_unix, decided_at_unix, decision_reason
              FROM permission_requests ORDER BY created_at_unix DESC LIMIT 200",
         )
@@ -231,6 +233,15 @@ pub(crate) async fn list_permission_requests(
                 .into_iter()
                 .map(|row| PermissionRequestSummary {
                     id: row.get("id"),
+                    requester_profile_id: row.get("requester_profile_id"),
+                    requester_kind: if row
+                        .get::<Option<String>, _>("requester_credential_id")
+                        .is_some()
+                    {
+                        "request credential".to_owned()
+                    } else {
+                        "interactive session".to_owned()
+                    },
                     action: row.get("action"),
                     role: row.get("role"),
                     steam_id64: row.get("steam_id64"),
