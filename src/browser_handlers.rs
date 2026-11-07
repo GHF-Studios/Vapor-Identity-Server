@@ -28,8 +28,7 @@ use crate::config::{
     BROWSER_LOGIN_ATTEMPT_TTL_SECONDS, DASHBOARD_SESSION_TTL_SECONDS, STEAM_OPENID_ENDPOINT,
 };
 use crate::permission_requests::{
-    approve_permission_request, create_permission_request, reject_permission_request,
-    ApprovePermissionRequest, CreatePermissionRequest, RejectPermissionRequest,
+    create_permission_request, CreatePermissionRequest,
 };
 use crate::persistence::*;
 use crate::providers::{exchange_github_web_code, verify_github_access_token, verify_steam_openid};
@@ -422,7 +421,7 @@ pub(crate) async fn admin_dashboard(
         }
     };
     let request_rows = match sqlx::query(
-        "SELECT id, requester_profile_id, action, role, steam_id64, github_login, version, created_at_unix, expires_at_unix
+        "SELECT id, requester_profile_id, action, role, steam_id64, github_login, created_at_unix, expires_at_unix
          FROM permission_requests WHERE status = 'pending' AND expires_at_unix > ? ORDER BY created_at_unix DESC LIMIT 200",
     )
     .bind(unix_now_i64())
@@ -476,19 +475,15 @@ pub(crate) async fn admin_dashboard(
     }
     let mut permission_requests = String::new();
     for row in request_rows {
-        let id: String = row.get("id");
-        let version: i64 = row.get("version");
-        permission_requests.push_str(&format!(
-            "<tr><td><code>{}</code></td><td><code>{}</code></td><td>{}</td><td>{}</td><td>Steam {} / GitHub {}</td><td>{}</td><td>{}</td><td><form class=\"inline\" method=\"post\" action=\"/admin/identity/permission-requests/{}/approve\"><input type=\"hidden\" name=\"expected_version\" value=\"{}\"><label><input type=\"checkbox\" name=\"confirmed\" value=\"true\" required> confirm</label><button type=\"submit\">Approve</button></form><form class=\"inline\" method=\"post\" action=\"/admin/identity/permission-requests/{}/reject\"><input type=\"hidden\" name=\"expected_version\" value=\"{}\"><input type=\"hidden\" name=\"reason\" value=\"Rejected by root administrator\"><label><input type=\"checkbox\" name=\"confirmed\" value=\"true\" required> confirm</label><button type=\"submit\">Reject</button></form></td></tr>",
-            html_escape(&id),
-            html_escape(row.get::<String, _>("requester_profile_id").as_str()),
-            html_escape(row.get::<String, _>("action").as_str()),
-            html_escape(row.get::<String, _>("role").as_str()),
-            html_escape(row.get::<String, _>("steam_id64").as_str()),
-            html_escape(row.get::<String, _>("github_login").as_str()),
-            dashboard_time(row.get::<i64, _>("created_at_unix")),
-            dashboard_time(row.get::<i64, _>("expires_at_unix")),
-            html_escape(&id), version, html_escape(&id), version
+        permission_requests.push_str(&render_pending_permission_request_row(
+            row.get::<String, _>("id").as_str(),
+            row.get::<String, _>("requester_profile_id").as_str(),
+            row.get::<String, _>("action").as_str(),
+            row.get::<String, _>("role").as_str(),
+            row.get::<String, _>("steam_id64").as_str(),
+            row.get::<String, _>("github_login").as_str(),
+            row.get::<i64, _>("created_at_unix"),
+            row.get::<i64, _>("expires_at_unix"),
         ));
     }
     if permission_requests.is_empty() {
@@ -606,7 +601,7 @@ pub(crate) async fn admin_dashboard(
          <button type=\"submit\">Grant role</button></form>\
          <p>This form requires your root dashboard session. It still refuses grants unless the SteamID64 and GitHub login are already linked to the same profile.</p>\
          <p>Root implies content-developer. To demote a root profile to developer, first grant <code>content-developer</code>, then revoke <code>root</code>.</p>\
-         <h2>Pending permission requests</h2><p>Role changes remain pending until approved here by a root session.</p><div class=\"table-scroll\"><table><thead><tr><th>Request</th><th>Requester profile</th><th>Action</th><th>Role</th><th>Subject</th><th>Created</th><th>Expires</th><th>Decision</th></tr></thead><tbody>{permission_requests}</tbody></table></div>\
+         <h2>Pending permission requests</h2><p>Review and decide pending requests in <a href=\"/admin/approvals#pending-identity-approvals\">Approvals</a>. Identity records the decision and remains the source of truth.</p><div class=\"table-scroll\"><table><thead><tr><th>Request</th><th>Requester profile</th><th>Action</th><th>Role</th><th>Subject</th><th>Created</th><th>Expires</th><th>Review</th></tr></thead><tbody>{permission_requests}</tbody></table></div>\
          <h2>Past permission requests</h2><p class=\"muted\">Read-only decisions, persisted expirations, and overdue pending requests. Overdue rows are labeled while Identity's stored transition remains pending; they are not actionable here.</p><div class=\"table-scroll\"><table><thead><tr><th>Request</th><th>Requester profile</th><th>Status</th><th>Action</th><th>Role</th><th>Subject</th><th>Created</th><th>Expires</th><th>Decided</th><th>Decision reason</th></tr></thead><tbody>{permission_history}</tbody></table></div>\
          <h2>Automation request credentials</h2><p>These credentials can submit only the selected request types. Copy the secret from the one-time creation response; it is not stored or shown again.</p><form method=\"post\" action=\"/admin/identity/automation-credentials\"><label>Label <input name=\"label\" maxlength=\"80\" required></label><label>Expires in days <input name=\"expires_in_days\" type=\"number\" min=\"1\" max=\"90\" value=\"30\" required></label><label><input type=\"checkbox\" name=\"platform_deploy_requests\" value=\"true\"> Create Platform deploy requests</label><label><input type=\"checkbox\" name=\"platform_ssh_access_requests\" value=\"true\"> Request temporary Platform SSH access</label><label><input type=\"checkbox\" name=\"identity_role_requests\" value=\"true\"> Create Identity role requests</label><button type=\"submit\">Create request credential</button></form><table><thead><tr><th>Label</th><th>Scopes</th><th>Created</th><th>Expires</th><th>Status</th><th>Action</th></tr></thead><tbody>{credentials}</tbody></table>\
          <h2>Profiles</h2><table><thead><tr><th>Name</th><th>Steam</th><th>GitHub</th><th>Effective roles</th><th>Actions</th></tr></thead><tbody>{rows}</tbody></table>\
@@ -614,6 +609,29 @@ pub(crate) async fn admin_dashboard(
         html_escape(current.steam_id64.as_deref().unwrap_or("unknown")),
         github_browser_ready(&state.config)
     ))
+}
+
+fn render_pending_permission_request_row(
+    id: &str,
+    requester_profile_id: &str,
+    action: &str,
+    role: &str,
+    steam_id64: &str,
+    github_login: &str,
+    created_at_unix: i64,
+    expires_at_unix: i64,
+) -> String {
+    format!(
+        "<tr><td><code>{}</code></td><td><code>{}</code></td><td>{}</td><td>{}</td><td>Steam {} / GitHub {}</td><td>{}</td><td>{}</td><td><a href=\"/admin/approvals#pending-identity-approvals\">Review in Approvals</a></td></tr>",
+        html_escape(id),
+        html_escape(requester_profile_id),
+        html_escape(action),
+        html_escape(role),
+        html_escape(steam_id64),
+        html_escape(github_login),
+        dashboard_time(created_at_unix),
+        dashboard_time(expires_at_unix),
+    )
 }
 
 fn dashboard_time(timestamp: i64) -> String {
@@ -787,38 +805,6 @@ async fn permission_request_form_response(response: Response, action: &str) -> R
     ))
 }
 
-pub(crate) async fn admin_approve_permission_request_form(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(id): Path<String>,
-    Form(request): Form<ApprovePermissionRequest>,
-) -> Response {
-    if !same_origin_browser_request(&headers, &state.config) {
-        return admin_text_response(
-            StatusCode::FORBIDDEN,
-            "identity: same-origin request required",
-        );
-    }
-    let response = approve_permission_request(State(state), headers, Path(id), Json(request)).await;
-    permission_decision_form_response(response, "approve").await
-}
-
-pub(crate) async fn admin_reject_permission_request_form(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(id): Path<String>,
-    Form(request): Form<RejectPermissionRequest>,
-) -> Response {
-    if !same_origin_browser_request(&headers, &state.config) {
-        return admin_text_response(
-            StatusCode::FORBIDDEN,
-            "identity: same-origin request required",
-        );
-    }
-    let response = reject_permission_request(State(state), headers, Path(id), Json(request)).await;
-    permission_decision_form_response(response, "reject").await
-}
-
 pub(crate) async fn admin_create_automation_credential_form(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -982,7 +968,10 @@ fn external_identity_label(steam_ids: Option<&str>, github_logins: Option<&str>)
 
 #[cfg(test)]
 mod automation_credential_form_tests {
-    use super::{admin_fragment_error_response, admin_fragment_response, AutomationCredentialForm};
+    use super::{
+        admin_fragment_error_response, admin_fragment_response,
+        render_pending_permission_request_row, AutomationCredentialForm,
+    };
     use axum::body::to_bytes;
     use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE};
     use axum::http::StatusCode;
@@ -1007,6 +996,27 @@ mod automation_credential_form_tests {
         assert!(!form.platform_deploy_requests);
         assert!(!form.platform_ssh_access_requests);
         assert!(!form.identity_role_requests);
+    }
+
+    #[test]
+    fn pending_permission_rows_link_to_shared_approvals_without_decision_forms() {
+        let row = render_pending_permission_request_row(
+            "request-<one>",
+            "profile-1",
+            "grant",
+            "content-developer",
+            "76561198000000000",
+            "leslie",
+            100,
+            200,
+        );
+
+        assert!(row.contains("href=\"/admin/approvals#pending-identity-approvals\""));
+        assert!(row.contains("Review in Approvals"));
+        assert!(row.contains("request-&lt;one&gt;"));
+        assert!(!row.contains("<form"));
+        assert!(!row.contains("/approve"));
+        assert!(!row.contains("/reject"));
     }
 
     #[tokio::test]

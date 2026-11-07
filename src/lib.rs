@@ -189,14 +189,6 @@ pub async fn routers_from_env() -> Result<HostRouters, Box<dyn std::error::Error
         .route("/admin/identity/roles/grant", post(admin_grant_role_form))
         .route("/admin/identity/roles/revoke", post(admin_revoke_role_form))
         .route(
-            "/admin/identity/permission-requests/{id}/approve",
-            post(admin_approve_permission_request_form),
-        )
-        .route(
-            "/admin/identity/permission-requests/{id}/reject",
-            post(admin_reject_permission_request_form),
-        )
-        .route(
             "/admin/identity/automation-credentials",
             post(admin_create_automation_credential_form),
         )
