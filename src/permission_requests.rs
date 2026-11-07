@@ -3,7 +3,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::{Deserialize, Serialize};
-use sqlx::{Row, Sqlite, Transaction};
+use sqlx::{Row, Sqlite, SqlitePool, Transaction};
 use uuid::Uuid;
 
 use crate::automation_credentials::{
@@ -18,6 +18,8 @@ use crate::util::{
 };
 
 const REQUEST_TTL_SECONDS: i64 = 7 * 24 * 60 * 60;
+const EXPIRY_SWEEP_BATCH_SIZE: i64 = 100;
+const EXPIRY_SWEEP_MAX_BATCHES: usize = 10;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -71,6 +73,70 @@ struct PermissionRequestSummary {
 struct RequestActor {
     profile_id: String,
     credential: Option<RequestCredentialPrincipal>,
+}
+
+pub(crate) async fn expire_pending_permission_requests(
+    pool: &SqlitePool,
+    now: i64,
+) -> Result<u64, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    serialize_permission_mutation(&mut tx).await?;
+    let rows = sqlx::query(
+        "SELECT id, resolved_profile_id, version
+         FROM permission_requests
+         WHERE status = 'pending' AND expires_at_unix <= ?
+         ORDER BY expires_at_unix, created_at_unix, id
+         LIMIT ?",
+    )
+    .bind(now)
+    .bind(EXPIRY_SWEEP_BATCH_SIZE)
+    .fetch_all(&mut *tx)
+    .await?;
+
+    let mut expired_count = 0;
+    for row in rows {
+        let id: String = row.get("id");
+        let subject_profile_id: String = row.get("resolved_profile_id");
+        let version: i64 = row.get("version");
+        let updated = sqlx::query(
+            "UPDATE permission_requests
+             SET status = 'expired', version = version + 1, decided_at_unix = ?
+             WHERE id = ? AND status = 'pending' AND version = ? AND expires_at_unix <= ?",
+        )
+        .bind(now)
+        .bind(&id)
+        .bind(version)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+        if updated.rows_affected() == 1 {
+            audit_event_in_tx(
+                &mut tx,
+                "permission_request_expired",
+                None,
+                Some(&subject_profile_id),
+                &format!("request_id={id}"),
+            )
+            .await?;
+            expired_count += 1;
+        }
+    }
+    tx.commit().await?;
+    Ok(expired_count)
+}
+
+pub(crate) async fn sweep_expired_permission_requests(
+    pool: &SqlitePool,
+) -> Result<u64, sqlx::Error> {
+    let mut total = 0;
+    for _ in 0..EXPIRY_SWEEP_MAX_BATCHES {
+        let expired = expire_pending_permission_requests(pool, unix_now_i64()).await?;
+        total += expired;
+        if expired < EXPIRY_SWEEP_BATCH_SIZE as u64 {
+            return Ok(total);
+        }
+    }
+    Ok(total)
 }
 
 pub(crate) async fn create_permission_request(
@@ -303,6 +369,7 @@ pub(crate) async fn approve_permission_request(
     let status: String = row.get("status");
     let version: i64 = row.get("version");
     let expires_at: i64 = row.get("expires_at_unix");
+    let subject_profile_id: String = row.get("resolved_profile_id");
     if status != "pending" || version != request.expected_version {
         return (
             StatusCode::CONFLICT,
@@ -311,20 +378,31 @@ pub(crate) async fn approve_permission_request(
             .into_response();
     }
     if expires_at <= unix_now_i64() {
-        let changed = sqlx::query("UPDATE permission_requests SET status = 'expired', version = version + 1, decided_at_unix = ? WHERE id = ? AND status = 'pending' AND version = ?")
-            .bind(unix_now_i64()).bind(&id).bind(request.expected_version).execute(&mut *tx).await;
-        if matches!(changed, Ok(result) if result.rows_affected() == 1)
-            && audit_event_in_tx(
+        let now = unix_now_i64();
+        let changed = sqlx::query(
+            "UPDATE permission_requests
+             SET status = 'expired', version = version + 1, decided_at_unix = ?
+             WHERE id = ? AND status = 'pending' AND version = ? AND expires_at_unix <= ?",
+        )
+        .bind(now)
+        .bind(&id)
+        .bind(request.expected_version)
+        .bind(now)
+        .execute(&mut *tx)
+        .await;
+        if !matches!(changed, Ok(result) if result.rows_affected() == 1)
+            || audit_event_in_tx(
                 &mut tx,
                 "permission_request_expired",
                 None,
-                None,
+                Some(&subject_profile_id),
                 &format!("request_id={id}"),
             )
             .await
-            .is_ok()
+            .is_err()
+            || tx.commit().await.is_err()
         {
-            let _ = tx.commit().await;
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
         }
         return (StatusCode::GONE, "permission request expired\n").into_response();
     }
@@ -729,8 +807,8 @@ async fn audit_event_in_tx(
 #[cfg(test)]
 mod tests {
     use super::{
-        approve_permission_request, create_permission_request, ApprovePermissionRequest,
-        CreatePermissionRequest,
+        approve_permission_request, create_permission_request, expire_pending_permission_requests,
+        ApprovePermissionRequest, CreatePermissionRequest,
     };
     use crate::automation_credentials::credential_digest;
     use crate::config::AuthConfig;
@@ -1020,6 +1098,113 @@ mod tests {
             sqlx::query_scalar::<_, i64>(
                 "SELECT COUNT(*) FROM audit_events WHERE event_type = 'permission_request_stale'"
             )
+            .fetch_one(&state.pool)
+            .await
+            .unwrap(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn expiry_sweep_persists_status_and_audit_once() {
+        let state = state().await;
+        linked_profile(&state, "requester", "76561198155555551", "requester", true).await;
+        linked_profile(
+            &state,
+            "expired-subject",
+            "76561198155555552",
+            "expiredsubject",
+            false,
+        )
+        .await;
+        linked_profile(
+            &state,
+            "current-subject",
+            "76561198155555553",
+            "currentsubject",
+            false,
+        )
+        .await;
+        let headers = root_headers(&state, "requester").await;
+        let expired_id = request_id(
+            create_permission_request(
+                State(state.clone()),
+                headers.clone(),
+                request(
+                    "grant",
+                    "content-developer",
+                    "76561198155555552",
+                    "expiredsubject",
+                ),
+            )
+            .await,
+        )
+        .await;
+        let current_id = request_id(
+            create_permission_request(
+                State(state.clone()),
+                headers,
+                request(
+                    "grant",
+                    "content-developer",
+                    "76561198155555553",
+                    "currentsubject",
+                ),
+            )
+            .await,
+        )
+        .await;
+        let now = crate::util::unix_now_i64();
+        sqlx::query("UPDATE permission_requests SET expires_at_unix = ? WHERE id = ?")
+            .bind(now - 1)
+            .bind(&expired_id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+
+        let count = expire_pending_permission_requests(&state.pool, now)
+            .await
+            .unwrap();
+
+        assert_eq!(count, 1);
+        let expired: (String, i64, Option<i64>) = sqlx::query_as(
+            "SELECT status, version, decided_at_unix FROM permission_requests WHERE id = ?",
+        )
+        .bind(&expired_id)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!(expired.0, "expired");
+        assert_eq!(expired.1, 2);
+        assert_eq!(expired.2, Some(now));
+        let current: (String, i64) =
+            sqlx::query_as("SELECT status, version FROM permission_requests WHERE id = ?")
+                .bind(&current_id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(current, ("pending".to_string(), 1));
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM audit_events WHERE event_type = 'permission_request_expired' AND subject_profile_id = 'expired-subject' AND detail = ?",
+            )
+            .bind(format!("request_id={expired_id}"))
+            .fetch_one(&state.pool)
+            .await
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            expire_pending_permission_requests(&state.pool, now)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM audit_events WHERE event_type = 'permission_request_expired' AND detail = ?",
+            )
+            .bind(format!("request_id={expired_id}"))
             .fetch_one(&state.pool)
             .await
             .unwrap(),

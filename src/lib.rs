@@ -29,6 +29,7 @@ use axum::Router;
 use std::env;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::fs;
 
 use crate::api_handlers::*;
@@ -46,7 +47,7 @@ use crate::config::{read_auth_config, DEFAULT_DB_NAME, DEFAULT_STATE_DIR, MAX_AU
 use crate::db::{open_database, run_migrations};
 use crate::permission_requests::{
     approve_permission_request, create_permission_request, list_permission_requests,
-    reject_permission_request,
+    reject_permission_request, sweep_expired_permission_requests,
 };
 use crate::types::AppState;
 
@@ -88,6 +89,18 @@ pub async fn routers_from_env() -> Result<HostRouters, Box<dyn std::error::Error
         config,
         http,
     };
+    let expiry_pool = state.pool.clone();
+    tokio::spawn(async move {
+        loop {
+            if sweep_expired_permission_requests(&expiry_pool)
+                .await
+                .is_err()
+            {
+                eprintln!("Identity permission-request expiry sweep failed; it will retry.");
+            }
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        }
+    });
     let api = Router::new()
         .route("/healthz", get(healthz))
         .route("/v1/status", get(status))
