@@ -390,7 +390,7 @@ pub(crate) async fn admin_dashboard(
     let current = match current_profile_from_headers(&state.pool, &headers).await {
         Ok(profile) => profile,
         Err(_) => {
-            return admin_text_response(
+            return admin_fragment_error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "identity: failed to validate dashboard session",
             );
@@ -406,7 +406,7 @@ pub(crate) async fn admin_dashboard(
     let profile_rows = match profile_rows(&state.pool).await {
         Ok(rows) => rows,
         Err(_) => {
-            return admin_text_response(
+            return admin_fragment_error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "identity: failed to load dashboard",
             );
@@ -415,7 +415,7 @@ pub(crate) async fn admin_dashboard(
     let audit_rows = match recent_audit_events(&state.pool, 25).await {
         Ok(rows) => rows,
         Err(_) => {
-            return admin_text_response(
+            return admin_fragment_error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "identity: failed to load dashboard audit events",
             );
@@ -430,7 +430,7 @@ pub(crate) async fn admin_dashboard(
     .await
     {
         Ok(rows) => rows,
-        Err(_) => return admin_text_response(StatusCode::INTERNAL_SERVER_ERROR, "identity: failed to load permission requests"),
+        Err(_) => return admin_fragment_error_response(StatusCode::INTERNAL_SERVER_ERROR, "identity: failed to load permission requests"),
     };
     let credential_rows = match sqlx::query(
         "SELECT id, label, scopes, created_at_unix, expires_at_unix, revoked_at_unix
@@ -441,7 +441,7 @@ pub(crate) async fn admin_dashboard(
     {
         Ok(rows) => rows,
         Err(_) => {
-            return admin_text_response(
+            return admin_fragment_error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "identity: failed to load automation credentials",
             )
@@ -506,7 +506,7 @@ pub(crate) async fn admin_dashboard(
     {
         Ok(rows) => rows,
         Err(_) => {
-            return admin_text_response(
+            return admin_fragment_error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "identity: failed to load permission request history",
             )
@@ -629,6 +629,16 @@ fn admin_fragment_response(body: String) -> Response {
         ),
     );
     admin_private_response(response)
+}
+
+fn admin_fragment_error_response(status: StatusCode, message: &str) -> Response {
+    let fragment = format!(
+        "<p class=\"eyebrow\">Identity</p><h1>Identity page unavailable</h1><p class=\"error\">{}</p>",
+        html_escape(message)
+    );
+    let mut response = admin_fragment_response(fragment);
+    *response.status_mut() = status;
+    response
 }
 
 fn admin_text_response(status: StatusCode, body: &str) -> Response {
@@ -972,7 +982,7 @@ fn external_identity_label(steam_ids: Option<&str>, github_logins: Option<&str>)
 
 #[cfg(test)]
 mod automation_credential_form_tests {
-    use super::{admin_fragment_response, AutomationCredentialForm};
+    use super::{admin_fragment_error_response, admin_fragment_response, AutomationCredentialForm};
     use axum::body::to_bytes;
     use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE};
     use axum::http::StatusCode;
@@ -1010,5 +1020,24 @@ mod automation_credential_form_tests {
         assert_eq!(response.headers()[CACHE_CONTROL], "private, no-store");
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         assert_eq!(&body[..], b"<h1>Identity</h1>");
+    }
+
+    #[tokio::test]
+    async fn admin_dashboard_errors_use_the_shared_page_fragment_contract() {
+        let response = admin_fragment_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "identity: failed to load <dashboard>",
+        );
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            response.headers()[CONTENT_TYPE],
+            "application/vnd.vapor.admin-page.v1+html; charset=utf-8"
+        );
+        assert_eq!(response.headers()[CACHE_CONTROL], "private, no-store");
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let fragment = std::str::from_utf8(&body).unwrap();
+        assert!(fragment.contains("Identity page unavailable"));
+        assert!(fragment.contains("failed to load &lt;dashboard&gt;"));
+        assert!(!fragment.contains("<!doctype html>"));
     }
 }
