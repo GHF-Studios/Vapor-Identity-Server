@@ -182,9 +182,8 @@ pub(crate) fn admin_locked_html(current: Option<&CurrentProfile>) -> String {
     };
 
     format!(
-        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Vapor Identity</title><link rel=\"stylesheet\" href=\"/admin/assets/admin.css\"><script defer src=\"/admin/assets/admin.js\"></script></head><body><main id=\"admin-content\">\
-         <p class=\"eyebrow\">Identity</p><h1>Accounts and access</h1>{body}\
-         <p>Admin access requires linked Steam and GitHub identities plus the <code>root</code> role.</p></main></body></html>"
+        "<p class=\"eyebrow\">Identity</p><h1>Accounts and access</h1>{body}\
+         <p>Admin access requires linked Steam and GitHub identities plus the <code>root</code> role.</p>"
     )
 }
 

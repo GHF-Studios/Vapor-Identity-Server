@@ -1,6 +1,6 @@
 use axum::body::to_bytes;
 use axum::extract::{Path, Query, State};
-use axum::http::header::{CACHE_CONTROL, LOCATION, SET_COOKIE};
+use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE, LOCATION, SET_COOKIE};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::Form;
@@ -397,10 +397,10 @@ pub(crate) async fn admin_dashboard(
         }
     };
     let Some(current) = current else {
-        return admin_html_response(admin_locked_html(None));
+        return admin_fragment_response(admin_locked_html(None));
     };
     if !current.root_authorized {
-        return admin_html_response(admin_locked_html(Some(&current)));
+        return admin_fragment_response(admin_locked_html(Some(&current)));
     }
 
     let profile_rows = match profile_rows(&state.pool).await {
@@ -589,9 +589,8 @@ pub(crate) async fn admin_dashboard(
         .map(|value| format!("<p class=\"error\">{}</p>", html_escape(value)))
         .unwrap_or_default();
 
-    admin_html_response(format!(
-        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Vapor Identity</title><link rel=\"stylesheet\" href=\"/admin/assets/admin.css\"><script defer src=\"/admin/assets/admin.js\"></script></head><body><main id=\"admin-content\">\
-         <p class=\"eyebrow\">Identity</p><h1>Accounts and access</h1>\
+    admin_fragment_response(format!(
+        "<p class=\"eyebrow\">Identity</p><h1>Accounts and access</h1>\
          <p>Signed in as Steam profile <code>{}</code>. Root role is active.</p>\
          <p><a href=\"/login\">Identity</a> · <a href=\"/logout\">Logout</a></p>\
          {notice}{error}\
@@ -611,7 +610,7 @@ pub(crate) async fn admin_dashboard(
          <h2>Past permission requests</h2><p class=\"muted\">Read-only decisions, persisted expirations, and overdue pending requests. Overdue rows are labeled while Identity's stored transition remains pending; they are not actionable here.</p><div class=\"table-scroll\"><table><thead><tr><th>Request</th><th>Requester profile</th><th>Status</th><th>Action</th><th>Role</th><th>Subject</th><th>Created</th><th>Expires</th><th>Decided</th><th>Decision reason</th></tr></thead><tbody>{permission_history}</tbody></table></div>\
          <h2>Automation request credentials</h2><p>These credentials can submit only the selected request types. Copy the secret from the one-time creation response; it is not stored or shown again.</p><form method=\"post\" action=\"/admin/identity/automation-credentials\"><label>Label <input name=\"label\" maxlength=\"80\" required></label><label>Expires in days <input name=\"expires_in_days\" type=\"number\" min=\"1\" max=\"90\" value=\"30\" required></label><label><input type=\"checkbox\" name=\"platform_deploy_requests\" value=\"true\"> Create Platform deploy requests</label><label><input type=\"checkbox\" name=\"platform_ssh_access_requests\" value=\"true\"> Request temporary Platform SSH access</label><label><input type=\"checkbox\" name=\"identity_role_requests\" value=\"true\"> Create Identity role requests</label><button type=\"submit\">Create request credential</button></form><table><thead><tr><th>Label</th><th>Scopes</th><th>Created</th><th>Expires</th><th>Status</th><th>Action</th></tr></thead><tbody>{credentials}</tbody></table>\
          <h2>Profiles</h2><table><thead><tr><th>Name</th><th>Steam</th><th>GitHub</th><th>Effective roles</th><th>Actions</th></tr></thead><tbody>{rows}</tbody></table>\
-         <h2>Recent audit events</h2><table><thead><tr><th>ID</th><th>Time</th><th>Event</th><th>Actor</th><th>Subject</th><th>Detail</th></tr></thead><tbody>{audit}</tbody></table></main></body></html>",
+         <h2>Recent audit events</h2><table><thead><tr><th>ID</th><th>Time</th><th>Event</th><th>Actor</th><th>Subject</th><th>Detail</th></tr></thead><tbody>{audit}</tbody></table>",
         html_escape(current.steam_id64.as_deref().unwrap_or("unknown")),
         github_browser_ready(&state.config)
     ))
@@ -621,8 +620,15 @@ fn dashboard_time(timestamp: i64) -> String {
     format!("<time data-unix=\"{timestamp}\">{timestamp}</time>")
 }
 
-fn admin_html_response(body: String) -> Response {
-    admin_private_response(Html(body).into_response())
+fn admin_fragment_response(body: String) -> Response {
+    let mut response = Response::new(body.into());
+    response.headers_mut().insert(
+        CONTENT_TYPE,
+        axum::http::HeaderValue::from_static(
+            "application/vnd.vapor.admin-page.v1+html; charset=utf-8",
+        ),
+    );
+    admin_private_response(response)
 }
 
 fn admin_text_response(status: StatusCode, body: &str) -> Response {
@@ -966,7 +972,10 @@ fn external_identity_label(steam_ids: Option<&str>, github_logins: Option<&str>)
 
 #[cfg(test)]
 mod automation_credential_form_tests {
-    use super::AutomationCredentialForm;
+    use super::{admin_fragment_response, AutomationCredentialForm};
+    use axum::body::to_bytes;
+    use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE};
+    use axum::http::StatusCode;
 
     #[test]
     fn one_checked_permission_deserializes_without_a_list_shape() {
@@ -988,5 +997,18 @@ mod automation_credential_form_tests {
         assert!(!form.platform_deploy_requests);
         assert!(!form.platform_ssh_access_requests);
         assert!(!form.identity_role_requests);
+    }
+
+    #[tokio::test]
+    async fn admin_page_fragment_uses_v1_media_type_and_private_cache() {
+        let response = admin_fragment_response("<h1>Identity</h1>".to_string());
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[CONTENT_TYPE],
+            "application/vnd.vapor.admin-page.v1+html; charset=utf-8"
+        );
+        assert_eq!(response.headers()[CACHE_CONTROL], "private, no-store");
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(&body[..], b"<h1>Identity</h1>");
     }
 }
