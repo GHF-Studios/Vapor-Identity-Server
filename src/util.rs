@@ -199,17 +199,27 @@ fn login_html_for_purpose(
             github_action,
         )
     } else {
-        "<p class=\"lead\">Use Steam to sign in to your Vapor account.</p>\
-         <p class=\"account-note\">Signing in is only needed for account features. Downloading Vapor and browsing public content do not require an account.</p>\
-         <p class=\"actions\"><a class=\"primary-action\" href=\"/login/steam\">Continue with Steam</a><a class=\"secondary-action\" href=\"/\">Back to Vapor</a></p>\
-         <p class=\"account-note\">GitHub is optional. Link it after sign-in when a creator workflow asks for it; it does not grant administrator access.</p>"
-            .to_string()
+        if operator {
+            "<p class=\"lead\">Platform admin uses a separate operator session from your regular Vapor account.</p>\
+             <p class=\"account-note\">Continue with Steam to open the operator session. This sign-in does not grant access by itself; the Platform root role is still required.</p>\
+             <p class=\"actions\"><a class=\"primary-action\" href=\"/login/steam\">Continue with Steam</a><a class=\"secondary-action\" href=\"/\">Back to Vapor</a></p>"
+                .to_string()
+        } else {
+            "<p class=\"lead\">Use Steam to sign in to your Vapor account.</p>\
+             <p class=\"account-note\">Signing in is only needed for account features. Downloading Vapor and browsing public content do not require an account.</p>\
+             <p class=\"actions\"><a class=\"primary-action\" href=\"/login/steam\">Continue with Steam</a><a class=\"secondary-action\" href=\"/\">Back to Vapor</a></p>\
+             <p class=\"account-note\">GitHub is optional. Link it after sign-in when a creator workflow asks for it; it does not grant administrator access.</p>"
+                .to_string()
+        }
     };
 
     let page = format!(
-        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><meta name=\"theme-color\" content=\"#10161d\"><title>Sign in · Vapor</title>\
-         <style>:root{{color-scheme:dark;font:16px/1.55 Inter,ui-sans-serif,system-ui,sans-serif;background:#10161d;color:#eef3f7;font-synthesis:none}}*{{box-sizing:border-box}}body{{margin:0;min-height:100vh;background:radial-gradient(ellipse at 50% -24%,#294346 0,#10161d 58%)}}a{{color:#a9d8cb}}a:focus-visible{{outline:2px solid #9fe1ce;outline-offset:4px;border-radius:3px}}main{{width:min(680px,calc(100% - 36px));margin:0 auto;padding:28px 0 56px}}nav{{display:flex;align-items:center;gap:20px;padding-bottom:clamp(58px,12vh,112px)}}.brand{{margin-right:auto;color:#eef3f7;font-weight:780;letter-spacing:.04em;text-decoration:none}}nav a:not(.brand){{color:#bac7ce;text-decoration:none;font-size:.92rem}}.eyebrow{{color:#9fe1ce;font-size:.76rem;font-weight:750;letter-spacing:.16em;text-transform:uppercase}}h1{{margin:10px 0 16px;font-size:clamp(2.5rem,7vw,4rem);letter-spacing:-.06em;line-height:1}}.panel{{padding:clamp(22px,5vw,36px);border:1px solid #34434a;border-radius:12px;background:rgba(20,29,35,.94);box-shadow:0 22px 80px rgba(0,0,0,.2)}}.lead{{margin:0;color:#c3cfd4;font-size:1.1rem}}.account-note{{margin:14px 0 0;color:#aebdc3;font-size:.92rem;line-height:1.65}}.signed-in{{margin:0;color:#c3cfd4}}.actions{{display:flex;align-items:center;flex-wrap:wrap;gap:16px;margin:22px 0 0}}.primary-action{{display:inline-flex;min-height:44px;align-items:center;justify-content:center;padding:0 17px;border-radius:7px;background:#9fe1ce;color:#10201d;font-weight:760;text-decoration:none}}.primary-action:hover{{background:#b8f0df}}.secondary-action{{font-weight:650;text-decoration:none}}footer{{margin-top:24px;color:#7f9298;font-size:.82rem}}@media(max-width:520px){{nav{{padding-bottom:54px}}.actions{{align-items:flex-start;flex-direction:column;gap:14px}}}}</style></head><body><main><nav aria-label=\"Main navigation\"><a class=\"brand\" href=\"/\">VAPOR</a><a href=\"/docs/\">Documentation</a></nav><section class=\"panel\" aria-labelledby=\"login-title\"><p class=\"eyebrow\">Vapor account</p><h1 id=\"login-title\">{}</h1>{body}</section><footer>Vapor sign-in uses Steam. Your game files remain local to you.</footer></main></body></html>",
-        if current.is_some() { "Your account" } else { "Sign in to Vapor" }
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><meta name=\"theme-color\" content=\"#10161d\"><title>{title}</title>\
+         <style>:root{{color-scheme:dark;font:16px/1.55 Inter,ui-sans-serif,system-ui,sans-serif;background:#10161d;color:#eef3f7;font-synthesis:none}}*{{box-sizing:border-box}}body{{margin:0;min-height:100vh;background:radial-gradient(ellipse at 50% -24%,#294346 0,#10161d 58%)}}a{{color:#a9d8cb}}a:focus-visible{{outline:2px solid #9fe1ce;outline-offset:4px;border-radius:3px}}main{{width:min(680px,calc(100% - 36px));margin:0 auto;padding:28px 0 56px}}nav{{display:flex;align-items:center;gap:20px;padding-bottom:clamp(58px,12vh,112px)}}.brand{{margin-right:auto;color:#eef3f7;font-weight:780;letter-spacing:.04em;text-decoration:none}}nav a:not(.brand){{color:#bac7ce;text-decoration:none;font-size:.92rem}}.eyebrow{{color:#9fe1ce;font-size:.76rem;font-weight:750;letter-spacing:.16em;text-transform:uppercase}}h1{{margin:10px 0 16px;font-size:clamp(2.5rem,7vw,4rem);letter-spacing:-.06em;line-height:1}}.panel{{padding:clamp(22px,5vw,36px);border:1px solid #34434a;border-radius:12px;background:rgba(20,29,35,.94);box-shadow:0 22px 80px rgba(0,0,0,.2)}}.lead{{margin:0;color:#c3cfd4;font-size:1.1rem}}.account-note{{margin:14px 0 0;color:#aebdc3;font-size:.92rem;line-height:1.65}}.signed-in{{margin:0;color:#c3cfd4}}.actions{{display:flex;align-items:center;flex-wrap:wrap;gap:16px;margin:22px 0 0}}.primary-action{{display:inline-flex;min-height:44px;align-items:center;justify-content:center;padding:0 17px;border-radius:7px;background:#9fe1ce;color:#10201d;font-weight:760;text-decoration:none}}.primary-action:hover{{background:#b8f0df}}.secondary-action{{font-weight:650;text-decoration:none}}footer{{margin-top:24px;color:#7f9298;font-size:.82rem}}@media(max-width:520px){{nav{{padding-bottom:54px}}.actions{{align-items:flex-start;flex-direction:column;gap:14px}}}}</style></head><body><main><nav aria-label=\"Main navigation\"><a class=\"brand\" href=\"/\">VAPOR</a><a href=\"/docs/\">Documentation</a></nav><section class=\"panel\" aria-labelledby=\"login-title\"><p class=\"eyebrow\">{eyebrow}</p><h1 id=\"login-title\">{heading}</h1>{body}</section><footer>{footer}</footer></main></body></html>",
+        title = if operator { "Platform operator sign-in · Vapor" } else { "Sign in · Vapor" },
+        eyebrow = if operator { "Platform operator access" } else { "Vapor account" },
+        heading = if operator { "Platform operator sign-in" } else if current.is_some() { "Your account" } else { "Sign in to Vapor" },
+        footer = if operator { "Steam establishes a separate operator session. Platform admin access still requires the root role." } else { "Vapor sign-in uses Steam. Your game files remain local to you." },
     );
     if operator {
         page.replace("/login", "/operator/login")
@@ -435,8 +445,8 @@ pub(crate) fn first_csv(value: Option<&str>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        browser_login_state_matches, redirect_with_cookie, redirect_with_login_state_cookie,
-        same_origin_browser_request,
+        browser_login_state_matches, operator_login_html, redirect_with_cookie,
+        redirect_with_login_state_cookie, same_origin_browser_request,
     };
     use crate::config::AuthConfig;
     use axum::http::{HeaderMap, HeaderValue, StatusCode};
@@ -475,6 +485,15 @@ mod tests {
 
         headers.remove("origin");
         assert!(!same_origin_browser_request(&headers, &config()));
+    }
+
+    #[test]
+    fn operator_login_explains_its_separate_session_and_root_requirement() {
+        let html = operator_login_html(&config(), None);
+        assert!(html.contains("separate operator session"));
+        assert!(html.contains("Platform root role"));
+        assert!(html.contains("/operator/login/steam"));
+        assert!(!html.contains("Use Steam to sign in to your Vapor account"));
     }
 
     #[test]
