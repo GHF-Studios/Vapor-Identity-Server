@@ -46,8 +46,8 @@ use crate::cli_authorizations::{
 use crate::config::{read_auth_config, DEFAULT_DB_NAME, DEFAULT_STATE_DIR, MAX_AUTH_BODY_BYTES};
 use crate::db::{open_database, run_migrations};
 use crate::permission_requests::{
-    approve_permission_request, create_permission_request, list_permission_requests,
-    reject_permission_request, sweep_expired_permission_requests,
+    approve_permission_request, create_permission_request, list_admin_permission_request_page,
+    list_permission_requests, reject_permission_request, sweep_expired_permission_requests,
 };
 use crate::types::AppState;
 
@@ -154,6 +154,10 @@ pub async fn routers_from_env() -> Result<HostRouters, Box<dyn std::error::Error
         .route(
             "/v1/admin/permission-requests",
             get(list_permission_requests).post(create_permission_request),
+        )
+        .route(
+            "/v1/admin/permission-requests/page",
+            get(list_admin_permission_request_page),
         )
         .route(
             "/v1/admin/permission-requests/{id}/approve",

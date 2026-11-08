@@ -267,6 +267,12 @@ pub(crate) async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error>
     .execute(&mut *tx)
     .await?;
     sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_permission_requests_created
+         ON permission_requests (created_at_unix DESC, id DESC)",
+    )
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
         "INSERT OR IGNORE INTO service_metadata (key, value, updated_at_unix)
          VALUES ('permission_mutation_lock', '0', ?)",
     )

@@ -1,7 +1,9 @@
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
 use serde::{Deserialize, Serialize};
 use sqlx::{Row, Sqlite, SqlitePool, Transaction};
 use uuid::Uuid;
@@ -20,6 +22,71 @@ use crate::util::{
 const REQUEST_TTL_SECONDS: i64 = 7 * 24 * 60 * 60;
 const EXPIRY_SWEEP_BATCH_SIZE: i64 = 100;
 const EXPIRY_SWEEP_MAX_BATCHES: usize = 10;
+const DEFAULT_ADMIN_PAGE_SIZE: usize = 50;
+const MAX_ADMIN_PAGE_SIZE: usize = 200;
+const MAX_ADMIN_CURSOR_BYTES: usize = 2048;
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PermissionRequestPageQuery {
+    limit: Option<usize>,
+    cursor: Option<String>,
+}
+
+impl PermissionRequestPageQuery {
+    fn page_size(&self) -> usize {
+        self.limit
+            .unwrap_or(DEFAULT_ADMIN_PAGE_SIZE)
+            .clamp(1, MAX_ADMIN_PAGE_SIZE)
+    }
+
+    fn decoded_cursor(&self) -> Result<Option<PermissionRequestPageCursor>, ()> {
+        let Some(cursor) = self.cursor.as_deref() else {
+            return Ok(None);
+        };
+        if cursor.is_empty() || cursor.len() > MAX_ADMIN_CURSOR_BYTES {
+            return Err(());
+        }
+        let bytes = URL_SAFE_NO_PAD.decode(cursor).map_err(|_| ())?;
+        let value: PermissionRequestPageCursor = serde_json::from_slice(&bytes).map_err(|_| ())?;
+        value.validate()?;
+        Ok(Some(value))
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PermissionRequestPageCursor {
+    created_at_unix: i64,
+    id: String,
+}
+
+impl PermissionRequestPageCursor {
+    fn validate(&self) -> Result<(), ()> {
+        if self.created_at_unix < 0
+            || self.id.is_empty()
+            || self.id.len() > 128
+            || self.id.chars().any(char::is_control)
+        {
+            return Err(());
+        }
+        Ok(())
+    }
+
+    fn encode(&self) -> Result<String, ()> {
+        self.validate()?;
+        let encoded = URL_SAFE_NO_PAD.encode(serde_json::to_vec(self).map_err(|_| ())?);
+        (encoded.len() <= MAX_ADMIN_CURSOR_BYTES)
+            .then_some(encoded)
+            .ok_or(())
+    }
+}
+
+#[derive(Serialize)]
+struct PermissionRequestPage {
+    items: Vec<PermissionRequestSummary>,
+    next_cursor: Option<String>,
+}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -323,6 +390,93 @@ pub(crate) async fn list_permission_requests(
             Json(requests).into_response()
         }
         Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+}
+
+pub(crate) async fn list_admin_permission_request_page(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<PermissionRequestPageQuery>,
+) -> Response {
+    if let Err(response) = root_session_actor(&state, &headers).await {
+        return response;
+    }
+    let cursor = match query.decoded_cursor() {
+        Ok(cursor) => cursor,
+        Err(()) => return (StatusCode::BAD_REQUEST, "invalid pagination cursor\n").into_response(),
+    };
+    let page_size = query.page_size();
+    let limit = (page_size + 1) as i64;
+    let rows = if let Some(cursor) = cursor {
+        sqlx::query(
+            "SELECT id, requester_profile_id, requester_credential_id, action, role, steam_id64, github_login, status, version,
+                    created_at_unix, expires_at_unix, decided_at_unix, decision_reason
+             FROM permission_requests
+             WHERE created_at_unix < ? OR (created_at_unix = ? AND id < ?)
+             ORDER BY created_at_unix DESC, id DESC LIMIT ?",
+        )
+        .bind(cursor.created_at_unix)
+        .bind(cursor.created_at_unix)
+        .bind(cursor.id)
+        .bind(limit)
+        .fetch_all(&state.pool)
+        .await
+    } else {
+        sqlx::query(
+            "SELECT id, requester_profile_id, requester_credential_id, action, role, steam_id64, github_login, status, version,
+                    created_at_unix, expires_at_unix, decided_at_unix, decision_reason
+             FROM permission_requests ORDER BY created_at_unix DESC, id DESC LIMIT ?",
+        )
+        .bind(limit)
+        .fetch_all(&state.pool)
+        .await
+    };
+    let mut rows = match rows {
+        Ok(rows) => rows,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let has_more = rows.len() > page_size;
+    if has_more {
+        rows.pop();
+    }
+    let next_cursor = if has_more {
+        rows.last().and_then(|row| {
+            PermissionRequestPageCursor {
+                created_at_unix: row.get("created_at_unix"),
+                id: row.get("id"),
+            }
+            .encode()
+            .ok()
+        })
+    } else {
+        None
+    };
+    let items = rows.into_iter().map(permission_request_summary).collect();
+    Json(PermissionRequestPage { items, next_cursor }).into_response()
+}
+
+fn permission_request_summary(row: sqlx::sqlite::SqliteRow) -> PermissionRequestSummary {
+    PermissionRequestSummary {
+        id: row.get("id"),
+        requester_profile_id: row.get("requester_profile_id"),
+        requester_kind: if row
+            .get::<Option<String>, _>("requester_credential_id")
+            .is_some()
+        {
+            "request credential".to_owned()
+        } else {
+            "interactive session".to_owned()
+        },
+        action: row.get("action"),
+        role: row.get("role"),
+        steam_id64: row.get("steam_id64"),
+        github_login: row.get("github_login"),
+        status: row.get("status"),
+        version: row.get("version"),
+        created_at_unix: row.get("created_at_unix"),
+        expires_at_unix: row.get("expires_at_unix"),
+        decided_at_unix: row.get("decided_at_unix"),
+        decision_reason: row.get("decision_reason"),
     }
 }
 
@@ -808,7 +962,8 @@ async fn audit_event_in_tx(
 mod tests {
     use super::{
         approve_permission_request, create_permission_request, expire_pending_permission_requests,
-        ApprovePermissionRequest, CreatePermissionRequest,
+        list_admin_permission_request_page, ApprovePermissionRequest, CreatePermissionRequest,
+        PermissionRequestPageQuery,
     };
     use crate::automation_credentials::credential_digest;
     use crate::config::AuthConfig;
@@ -1008,6 +1163,101 @@ mod tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn admin_permission_request_pages_cover_every_record_without_overlap() {
+        let state = state().await;
+        linked_profile(&state, "root-actor", "76561198122222231", "rootactor", true).await;
+        linked_profile(
+            &state,
+            "developer-subject",
+            "76561198122222232",
+            "developer",
+            false,
+        )
+        .await;
+        for id in ["request-a", "request-b", "request-c"] {
+            sqlx::query("INSERT INTO permission_requests (id, body_hash, action, role, steam_id64, github_login, resolved_profile_id, requester_profile_id, requester_credential_id, role_active_at_request, status, version, created_at_unix, expires_at_unix) VALUES (?, ?, 'grant', 'content-developer', '76561198122222232', 'developer', 'developer-subject', 'root-actor', NULL, 0, 'pending', 1, 100, 9999999999)")
+                .bind(id)
+                .bind("a".repeat(64))
+                .execute(&state.pool)
+                .await
+                .unwrap();
+        }
+
+        let headers = root_headers(&state, "root-actor").await;
+        let first = list_admin_permission_request_page(
+            State(state.clone()),
+            headers.clone(),
+            axum::extract::Query(PermissionRequestPageQuery {
+                limit: Some(2),
+                cursor: None,
+            }),
+        )
+        .await;
+        assert_eq!(first.status(), StatusCode::OK);
+        let first_bytes = to_bytes(first.into_body(), 16 * 1024).await.unwrap();
+        let first_json: serde_json::Value = serde_json::from_slice(&first_bytes).unwrap();
+        let first_ids = first_json["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["id"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(first_ids, vec!["request-c", "request-b"]);
+        let cursor = first_json["next_cursor"].as_str().unwrap().to_string();
+
+        let second = list_admin_permission_request_page(
+            State(state.clone()),
+            headers,
+            axum::extract::Query(PermissionRequestPageQuery {
+                limit: Some(2),
+                cursor: Some(cursor),
+            }),
+        )
+        .await;
+        assert_eq!(second.status(), StatusCode::OK);
+        let second_bytes = to_bytes(second.into_body(), 16 * 1024).await.unwrap();
+        let second_json: serde_json::Value = serde_json::from_slice(&second_bytes).unwrap();
+        let second_ids = second_json["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["id"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(second_ids, vec!["request-a"]);
+        assert!(second_json["next_cursor"].is_null());
+
+        let invalid_cursor = list_admin_permission_request_page(
+            State(state.clone()),
+            root_headers(&state, "root-actor").await,
+            axum::extract::Query(PermissionRequestPageQuery {
+                limit: Some(2),
+                cursor: Some("not-a-valid-cursor".to_string()),
+            }),
+        )
+        .await;
+        assert_eq!(invalid_cursor.status(), StatusCode::BAD_REQUEST);
+
+        let (_, developer_session, _) = create_identity_session(&state.pool, "developer-subject")
+            .await
+            .unwrap();
+        let mut developer_headers = HeaderMap::new();
+        developer_headers.insert(
+            "cookie",
+            HeaderValue::from_str(&format!("vapor_identity_session={developer_session}")).unwrap(),
+        );
+        let forbidden = list_admin_permission_request_page(
+            State(state),
+            developer_headers,
+            axum::extract::Query(PermissionRequestPageQuery {
+                limit: Some(2),
+                cursor: None,
+            }),
+        )
+        .await;
+        assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]

@@ -77,6 +77,7 @@ GET  /v1/admin/audit
 POST /v1/admin/roles/grant
 POST /v1/admin/roles/revoke
 GET  /v1/admin/permission-requests
+GET  /v1/admin/permission-requests/page?limit=50&cursor=...
 POST /v1/admin/permission-requests
 POST /v1/admin/permission-requests/{id}/approve
 POST /v1/admin/permission-requests/{id}/reject
@@ -155,6 +156,12 @@ request credential only for requests created with that credential. API
 responses omit internal profile and credential database ids. Requests expire
 after seven days; the immutable body digest binds action, role, SteamID64, and
 GitHub login.
+
+The root-only `GET /v1/admin/permission-requests/page` endpoint serves the
+dashboard inbox with keyset pagination (`limit` defaults to 50 and is capped at
+200). Its response is `{ "items": [...], "next_cursor": "..." }`; the opaque
+cursor is bound to the last record's creation time and id. It does not change
+the existing requester-facing list response.
 
 `POST /v1/admin/permission-requests/{id}/approve` and `/reject` require a current
 root dashboard session, exact configured Origin, expected request version, and
