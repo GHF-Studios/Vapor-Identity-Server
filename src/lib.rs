@@ -11,6 +11,7 @@ mod entitlements;
 mod permission_requests;
 mod persistence;
 mod profiles;
+mod project_memberships;
 mod provider_handlers;
 mod providers;
 mod session_handlers;
@@ -141,6 +142,22 @@ pub async fn routers_from_env() -> Result<HostRouters, Box<dyn std::error::Error
             "/v1/internal/automation/verify",
             post(verify_automation_credential),
         )
+        .route(
+            "/v1/internal/projects/list",
+            post(project_memberships::list_projects),
+        )
+        .route(
+            "/v1/internal/projects/check",
+            post(project_memberships::check_project),
+        )
+        .route(
+            "/v1/admin/project-memberships/grant",
+            post(project_memberships::grant_membership),
+        )
+        .route(
+            "/v1/admin/project-memberships/revoke",
+            post(project_memberships::revoke_membership),
+        )
         .route("/v1/admin/profiles", get(list_profiles))
         .route("/v1/admin/audit", get(list_audit_events))
         .route(
@@ -190,6 +207,18 @@ pub async fn routers_from_env() -> Result<HostRouters, Box<dyn std::error::Error
         .route("/logout", get(logout))
         .route("/admin/identity", get(admin_dashboard))
         .route("/admin/identity/", get(admin_dashboard))
+        .route(
+            "/admin/identity/project-memberships",
+            get(project_memberships::membership_fragment).layer(from_fn(no_store_admin_responses)),
+        )
+        .route(
+            "/admin/identity/project-memberships/grant",
+            post(project_memberships::grant_form).layer(from_fn(no_store_admin_responses)),
+        )
+        .route(
+            "/admin/identity/project-memberships/revoke",
+            post(project_memberships::revoke_form).layer(from_fn(no_store_admin_responses)),
+        )
         .route("/admin/identity/roles/grant", post(admin_grant_role_form))
         .route("/admin/identity/roles/revoke", post(admin_revoke_role_form))
         .route(
@@ -207,10 +236,29 @@ pub async fn routers_from_env() -> Result<HostRouters, Box<dyn std::error::Error
 }
 
 async fn no_store_admin_responses(request: Request<Body>, next: Next) -> Response {
+    let project_request = request.uri().path().starts_with("/v1/internal/projects/")
+        || request
+            .uri()
+            .path()
+            .starts_with("/v1/admin/project-memberships/")
+        || request
+            .uri()
+            .path()
+            .starts_with("/admin/identity/project-memberships");
     let mut response = next.run(request).await;
-    response.headers_mut().insert(
-        CACHE_CONTROL,
-        axum::http::HeaderValue::from_static("no-store"),
-    );
+    if project_request {
+        if response.status() == axum::http::StatusCode::UNPROCESSABLE_ENTITY {
+            *response.status_mut() = axum::http::StatusCode::BAD_REQUEST;
+        }
+        response.headers_mut().insert(
+            CACHE_CONTROL,
+            axum::http::HeaderValue::from_static("private, no-store"),
+        );
+    } else {
+        response.headers_mut().insert(
+            CACHE_CONTROL,
+            axum::http::HeaderValue::from_static("no-store"),
+        );
+    }
     response
 }

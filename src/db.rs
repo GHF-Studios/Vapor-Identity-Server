@@ -359,6 +359,19 @@ pub(crate) async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error>
     .bind(unix_now_i64())
     .execute(&mut *tx)
     .await?;
+    sqlx::query("CREATE TABLE IF NOT EXISTS project_memberships (
+        project_id TEXT NOT NULL CHECK(length(project_id) BETWEEN 1 AND 128 AND project_id NOT GLOB '*[^a-zA-Z0-9_-]*'),
+        profile_id TEXT NOT NULL REFERENCES profiles(id) ON DELETE RESTRICT,
+        role TEXT NOT NULL CHECK(role IN ('owner', 'developer', 'viewer')),
+        version INTEGER NOT NULL CHECK(version > 0),
+        granted_by_profile_id TEXT NOT NULL REFERENCES profiles(id) ON DELETE RESTRICT,
+        granted_at_unix INTEGER NOT NULL,
+        revoked_by_profile_id TEXT REFERENCES profiles(id) ON DELETE RESTRICT,
+        revoked_at_unix INTEGER,
+        PRIMARY KEY(project_id, profile_id)
+    )").execute(&mut *tx).await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_project_memberships_profile ON project_memberships(profile_id, revoked_at_unix)").execute(&mut *tx).await?;
+    sqlx::query("INSERT OR IGNORE INTO schema_migrations(version, name, applied_at_unix) VALUES (9, 'project_memberships', ?)").bind(unix_now_i64()).execute(&mut *tx).await?;
     tx.commit().await?;
     Ok(())
 }
@@ -422,6 +435,7 @@ pub(crate) async fn export_identity_state(
     let session_count = count_rows(pool, "identity_sessions").await?;
     let browser_login_attempt_count = count_rows(pool, "browser_login_attempts").await?;
     let automation_credential_count = count_rows(pool, "automation_credentials").await?;
+    let project_membership_count = count_rows(pool, "project_memberships").await?;
     let permission_request_count = count_rows(pool, "permission_requests").await?;
 
     let mut body = String::new();
@@ -443,6 +457,9 @@ pub(crate) async fn export_identity_state(
         }
     }
     body.push_str("\n[counts]\n");
+    body.push_str(&format!(
+        "project_memberships = {project_membership_count}\n"
+    ));
     body.push_str(&format!("profiles = {profile_count}\n"));
     body.push_str(&format!("steam_accounts = {steam_account_count}\n"));
     body.push_str(&format!("github_accounts = {github_account_count}\n"));
@@ -464,6 +481,7 @@ pub(crate) async fn export_identity_state(
 
 pub(crate) async fn count_rows(pool: &SqlitePool, table: &str) -> Result<i64, sqlx::Error> {
     let sql = match table {
+        "project_memberships" => "SELECT COUNT(*) FROM project_memberships",
         "profiles" => "SELECT COUNT(*) FROM profiles",
         "steam_accounts" => "SELECT COUNT(*) FROM steam_accounts",
         "github_accounts" => "SELECT COUNT(*) FROM github_accounts",
@@ -477,4 +495,34 @@ pub(crate) async fn count_rows(pool: &SqlitePool, table: &str) -> Result<i64, sq
         _ => unreachable!("table name is constrained by caller"),
     };
     sqlx::query_scalar(sql).fetch_one(pool).await
+}
+
+#[cfg(test)]
+mod project_migration_tests {
+    use super::*;
+    #[tokio::test]
+    async fn project_membership_migration_is_idempotent_and_constrains_roles() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        run_migrations(&pool).await.unwrap();
+        run_migrations(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO profiles(id, created_at_unix) VALUES ('actor', 1), ('subject', 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO project_memberships(project_id, profile_id, role, version, granted_by_profile_id, granted_at_unix) VALUES ('project-1', 'subject', 'viewer', 1, 'actor', 1)").execute(&pool).await.expect("membership table exists");
+        assert!(sqlx::query("UPDATE project_memberships SET role = 'root'")
+            .execute(&pool)
+            .await
+            .is_err());
+        let export = export_identity_state(&pool, Path::new("identity.sqlite3"))
+            .await
+            .unwrap();
+        assert!(export.contains("project_memberships = 1"));
+    }
 }

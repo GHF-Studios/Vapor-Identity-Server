@@ -291,3 +291,40 @@ src/profiles.rs           Steam-anchored profiles, sessions, roles
 src/providers.rs          Steam/GitHub external verification calls
 src/util.rs               small shared helpers and HTML shell rendering
 ```
+
+### Project membership authority
+
+Identity owns Project grants, independently of global roles. No global role
+(including root) grants Project access. Registry owns the Project metadata;
+Identity accepts only its opaque stable ID (1–128 ASCII letters/digits, `_`, `-`).
+Project roles are `viewer < developer < owner`.
+
+- `POST /v1/internal/projects/list`: `{ "audience": "vapor-registry", "session_token": "..." }`
+  returns `{ "memberships": [{ "project_id": "...", "role": "viewer" }], "expires_at_unix": 0 }`.
+- `POST /v1/internal/projects/check`: the same fields plus `project_id` and
+  `minimum_role`; returns `allowed`, optional current `role`, and `expires_at_unix`.
+- Both internal routes require the Registry-only bearer service credential and a
+  live, unrevoked session for an enabled profile. Registry forwards its caller's
+  `vapor_user_session` token in the JSON body. The public user-session login flow
+  is a separate prerequisite; these endpoints do not create or change cookies.
+- Invalid body/audience is 400, invalid service credential or inactive session
+  is 401, unavailable storage is 503. Responses are `private, no-store`.
+  Expiry is bounded by the session expiry and 30 seconds; callers must recheck
+  every private Project data request.
+- Root session operators use `POST /v1/admin/project-memberships/grant` or
+  `/revoke` with `{ "project_id": "...", "profile_id": "...", "role": "viewer",
+  "expected_version": 0, "confirmed": true }`. Expected version 0 creates a new
+  grant; subsequent changes use its current version. Stale versions return 409.
+  Identical changes at the current version return `changed: false` without
+  changing timestamps or adding a fake audit event. Responses contain `version`
+  and `changed`. All mutations require the existing root session, exact configured
+  Origin, and explicit confirmation; admin/service tokens cannot substitute.
+- `GET /admin/identity/project-memberships` provides a root-only management
+  fragment using the existing v1 admin-page media type, with HTML form grant and
+  revoke routes beneath it. Platform owns forwarding/composition of this route.
+
+Migration 9 adds membership state, actor/timestamp fields, version checks, and
+role constraints. Membership changes and their actor/subject audit events commit
+atomically. `/v1/export` remains a metadata/count manifest and adds the
+`project_memberships` count. Whole database snapshot/restore preserves active and
+revoked grants and audit records; no new row-import or secret export API exists.

@@ -593,6 +593,7 @@ pub(crate) async fn admin_dashboard(
          <ul><li>Steam browser login: <code>true</code></li>\
          <li>GitHub browser login configured: <code>{}</code></li>\
          <li>Dashboard session TTL: <code>{DASHBOARD_SESSION_TTL_SECONDS}s</code></li></ul>\
+         <p><a href=\"/admin/identity/project-memberships\">Manage Project memberships</a></p>\
          <h2>Grant role</h2>\
          <form method=\"post\" action=\"/admin/identity/roles/grant\">\
          <label>Role <select name=\"role\"><option value=\"content-developer\">content-developer</option><option value=\"root\">root</option></select></label>\
@@ -638,7 +639,7 @@ fn dashboard_time(timestamp: i64) -> String {
     format!("<time data-unix=\"{timestamp}\">{timestamp}</time>")
 }
 
-fn admin_fragment_response(body: String) -> Response {
+pub(crate) fn admin_fragment_response(body: String) -> Response {
     let mut response = Response::new(body.into());
     response.headers_mut().insert(
         CONTENT_TYPE,
