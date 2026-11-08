@@ -372,6 +372,33 @@ pub(crate) async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error>
     )").execute(&mut *tx).await?;
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_project_memberships_profile ON project_memberships(profile_id, revoked_at_unix)").execute(&mut *tx).await?;
     sqlx::query("INSERT OR IGNORE INTO schema_migrations(version, name, applied_at_unix) VALUES (9, 'project_memberships', ?)").bind(unix_now_i64()).execute(&mut *tx).await?;
+    let session_columns = sqlx::query("PRAGMA table_info(identity_sessions)")
+        .fetch_all(&mut *tx)
+        .await?;
+    if !session_columns
+        .iter()
+        .any(|r| r.get::<String, _>("name") == "purpose")
+    {
+        sqlx::query("ALTER TABLE identity_sessions ADD COLUMN purpose TEXT NOT NULL DEFAULT 'operator' CHECK(purpose IN ('operator', 'user'))").execute(&mut *tx).await?;
+    }
+    let split_applied: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM schema_migrations WHERE version = 10")
+            .fetch_one(&mut *tx)
+            .await?;
+    if split_applied == 0 {
+        sqlx::query("ALTER TABLE browser_login_attempts RENAME TO browser_login_attempts_old")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("CREATE TABLE browser_login_attempts (state TEXT PRIMARY KEY, flow TEXT NOT NULL CHECK(flow IN ('steam','github','user-steam','user-github')), profile_id TEXT REFERENCES profiles(id) ON DELETE CASCADE, created_at_unix INTEGER NOT NULL, expires_at_unix INTEGER NOT NULL, consumed_at_unix INTEGER)").execute(&mut *tx).await?;
+        sqlx::query("INSERT INTO browser_login_attempts SELECT * FROM browser_login_attempts_old")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DROP TABLE browser_login_attempts_old")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("CREATE INDEX idx_browser_login_attempts_active ON browser_login_attempts(flow, expires_at_unix, consumed_at_unix)").execute(&mut *tx).await?;
+        sqlx::query("INSERT INTO schema_migrations(version,name,applied_at_unix) VALUES (10,'public_operator_session_purposes',?)").bind(unix_now_i64()).execute(&mut *tx).await?;
+    }
     tx.commit().await?;
     Ok(())
 }
@@ -524,5 +551,39 @@ mod project_migration_tests {
             .await
             .unwrap();
         assert!(export.contains("project_memberships = 1"));
+    }
+    #[tokio::test]
+    async fn session_split_migration_preserves_legacy_operator_sessions_and_attempts() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE profiles(id TEXT PRIMARY KEY, display_name TEXT, created_at_unix INTEGER NOT NULL, disabled_at_unix INTEGER)").execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO profiles(id, created_at_unix) VALUES ('legacy', 1)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE identity_sessions(token_hash TEXT PRIMARY KEY, session_id TEXT UNIQUE NOT NULL, profile_id TEXT NOT NULL REFERENCES profiles(id), created_at_unix INTEGER NOT NULL, expires_at_unix INTEGER NOT NULL, revoked_at_unix INTEGER)").execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO identity_sessions VALUES ('hash', 'session', 'legacy', 1, 9999999999, NULL)").execute(&pool).await.unwrap();
+        sqlx::query("CREATE TABLE browser_login_attempts(state TEXT PRIMARY KEY, flow TEXT NOT NULL CHECK(flow IN ('steam','github')), profile_id TEXT REFERENCES profiles(id), created_at_unix INTEGER NOT NULL, expires_at_unix INTEGER NOT NULL, consumed_at_unix INTEGER)").execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO browser_login_attempts VALUES ('state', 'steam', NULL, 1, 9999999999, NULL)").execute(&pool).await.unwrap();
+        run_migrations(&pool).await.unwrap();
+        run_migrations(&pool).await.unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT purpose FROM identity_sessions WHERE session_id = 'session'"
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            "operator"
+        );
+        assert_eq!(sqlx::query_scalar::<_,i64>("SELECT COUNT(*) FROM browser_login_attempts WHERE state = 'state' AND flow = 'steam'").fetch_one(&pool).await.unwrap(), 1);
+        assert!(sqlx::query("UPDATE identity_sessions SET purpose = 'root'")
+            .execute(&pool)
+            .await
+            .is_err());
+        sqlx::query("INSERT INTO browser_login_attempts VALUES ('user-state', 'user-steam', NULL, 1, 9999999999, NULL)").execute(&pool).await.unwrap();
     }
 }

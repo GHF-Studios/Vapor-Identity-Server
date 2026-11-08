@@ -49,12 +49,15 @@ VAPOR_IDENTITY_ADMIN_TOKEN=<server-local secret>
 VAPOR_IDENTITY_COOKIE_PATH=/
 VAPOR_IDENTITY_COOKIE_SECURE=false
 VAPOR_IDENTITY_PUBLIC_ORIGIN=
+VAPOR_IDENTITY_OPERATOR_ORIGIN=
 ```
 
-`VAPOR_IDENTITY_PUBLIC_ORIGIN` must be the exact HTTPS origin used by the
-browser (scheme and host, with no trailing slash) for Identity admin form
-submissions. If it is unset, those writes fail closed; request-provided Host or
-forwarding headers are not accepted as the CSRF trust anchor.
+`VAPOR_IDENTITY_PUBLIC_ORIGIN` is the exact public account origin (scheme and
+host, with no trailing slash). `VAPOR_IDENTITY_OPERATOR_ORIGIN` is the exact
+operator origin for callbacks and Identity admin form submissions; when unset
+it falls back to the public origin for one-host setups. Without either configured
+origin, admin writes fail closed; request-provided Host or forwarding headers
+are not accepted as the CSRF trust anchor.
 
 ## Initial routes
 
@@ -93,6 +96,12 @@ GET  /login/github/callback
 GET  /cli/ssh/authorize
 POST /cli/ssh/authorize
 GET  /logout
+GET  /operator/login
+GET  /operator/login/steam
+GET  /operator/login/steam/callback
+GET  /operator/login/github
+GET  /operator/login/github/callback
+GET  /operator/logout
 GET  /admin/identity
 POST /admin/identity/roles/grant
 POST /admin/identity/roles/revoke
@@ -305,8 +314,8 @@ Project roles are `viewer < developer < owner`.
   `minimum_role`; returns `allowed`, optional current `role`, and `expires_at_unix`.
 - Both internal routes require the Registry-only bearer service credential and a
   live, unrevoked session for an enabled profile. Registry forwards its caller's
-  `vapor_user_session` token in the JSON body. The public user-session login flow
-  is a separate prerequisite; these endpoints do not create or change cookies.
+  `vapor_user_session` token in the JSON body. Only purpose `user` sessions are
+  accepted; operator sessions cannot authorize public Project access.
 - Invalid body/audience is 400, invalid service credential is 403, inactive session is 401, unavailable storage is 503. Responses are `private, no-store`.
   Expiry is bounded by the session expiry and 30 seconds; callers must recheck
   every private Project data request.
@@ -327,3 +336,44 @@ role constraints. Membership changes and their actor/subject audit events commit
 atomically. `/v1/export` remains a metadata/count manifest and adds the
 `project_memberships` count. Whole database snapshot/restore preserves active and
 revoked grants and audit records; no new row-import or secret export API exists.
+
+
+### Public and operator browser sessions
+
+`/login`, its Steam/GitHub start/callback routes, and `/logout` are the public
+account flow. Verified Steam sign-in issues only host-only `vapor_user_session`
+and redirects to `/dashboard`; it grants no global role. GitHub linking remains
+optional and still requires an existing Steam session.
+
+Operator login/linking routes are now `/operator/login`,
+`/operator/login/steam`, `/operator/login/steam/callback`,
+`/operator/login/github`, and `/operator/login/github/callback`;
+`/operator/logout` signs out that session. They retain host-only
+`vapor_identity_session` and the existing linked Steam + GitHub + root checks
+for operator authority. Both kinds retain the existing five-minute expiry.
+
+Migration 10 adds explicit `user|operator` purpose to Identity sessions. Existing
+sessions and API-issued root sessions remain `operator`. Every root/admin session
+lookup rejects public sessions, even if a user token is copied into an operator
+cookie or bearer header. Project membership decisions reject operator sessions.
+Browser state cookies and stored attempt flow names also separate the two flows.
+
+Set `VAPOR_IDENTITY_PUBLIC_ORIGIN` to the public account origin and
+`VAPOR_IDENTITY_OPERATOR_ORIGIN` to the operator origin. Both must be canonical
+HTTP(S) origins; operator origin falls back to public origin for one-host setups.
+Admin mutation Origin checks use the operator origin. The gateway must forward
+the public and operator paths to the appropriate Identity web handlers, and
+provider callback registration must cover the deployed callback URLs. Cookies
+have no Domain attribute. No Steam provider verification policy changes.
+
+For example, with public origin `https://vapor.example` and operator origin
+`https://admin.vapor.example`, the GitHub authorization redirect URIs are
+`https://vapor.example/login/github/callback` and
+`https://admin.vapor.example/operator/login/github/callback`. Ensure the
+configured GitHub app's callback registration permits the deployed URIs before
+using each linking flow. Steam uses the corresponding `/steam/callback` paths,
+including the bound state query. Steam login-state cookies are host-only and
+path-scoped to `/login/steam/callback` for public login and
+`/operator/login/steam/callback` for operator login; GitHub state follows the
+same separation. The provider client credentials and verification requirements
+are unchanged.

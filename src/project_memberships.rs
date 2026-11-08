@@ -93,7 +93,7 @@ async fn session(
         return Err(StatusCode::BAD_REQUEST);
     }
     let now = unix_now_i64();
-    let row = sqlx::query("SELECT s.profile_id, s.expires_at_unix FROM identity_sessions s JOIN profiles p ON p.id = s.profile_id WHERE s.token_hash = ? AND s.expires_at_unix > ? AND s.revoked_at_unix IS NULL AND p.disabled_at_unix IS NULL")
+    let row = sqlx::query("SELECT s.profile_id, s.expires_at_unix FROM identity_sessions s JOIN profiles p ON p.id = s.profile_id WHERE s.token_hash = ? AND s.expires_at_unix > ? AND s.revoked_at_unix IS NULL AND s.purpose = 'user' AND p.disabled_at_unix IS NULL")
         .bind(hash_session_token(token)).bind(now).fetch_optional(&state.pool).await.map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?.ok_or(StatusCode::UNAUTHORIZED)?;
     Ok((
         row.get("profile_id"),
@@ -370,6 +370,7 @@ mod tests {
                 cookie_secure: true,
                 cookie_path: "/".into(),
                 public_origin: Some("https://vapor.example".into()),
+                operator_origin: None,
             }),
             http: reqwest::Client::new(),
         }
@@ -462,7 +463,13 @@ mod tests {
     async fn live_session_and_registry_credential_are_required_and_global_roles_grant_nothing() {
         let s = state().await;
         let _ = root_headers(&s).await;
-        let (_, token, expiry) = create_identity_session(&s.pool, "actor").await.unwrap();
+        let (_, token, expiry) = crate::profiles::create_session_for_purpose(
+            &s.pool,
+            "actor",
+            crate::profiles::SessionPurpose::User,
+        )
+        .await
+        .unwrap();
         let request = || ProjectListRequest {
             audience: "vapor-registry".into(),
             session_token: token.clone(),
@@ -509,7 +516,13 @@ mod tests {
         mutate(&s.pool, "actor", &change("developer", 0), false)
             .await
             .unwrap();
-        let (_, token, _) = create_identity_session(&s.pool, "subject").await.unwrap();
+        let (_, token, _) = crate::profiles::create_session_for_purpose(
+            &s.pool,
+            "subject",
+            crate::profiles::SessionPurpose::User,
+        )
+        .await
+        .unwrap();
         for (project, minimum, expected) in [
             ("ghf-studios/loo-cast", "viewer", true),
             ("ghf-studios/loo-cast", "owner", false),
@@ -670,12 +683,34 @@ mod tests {
             3
         );
         restored.close().await;
-        std::fs::remove_file(path).unwrap();
+        drop(restored);
+        // SQLite's worker thread can release its final Windows file handle just
+        // after pool.close() wakes; allow that asynchronous cleanup to finish.
+        for attempt in 0..20 {
+            match std::fs::remove_file(&path) {
+                Ok(()) => break,
+                Err(error)
+                    if attempt < 19 && error.kind() == std::io::ErrorKind::PermissionDenied =>
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await
+                }
+                Err(error) if attempt < 19 && error.raw_os_error() == Some(32) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await
+                }
+                Err(error) => panic!("failed to remove restored SQLite test file: {error}"),
+            }
+        }
     }
     #[tokio::test]
     async fn invalid_expired_disabled_and_unavailable_sessions_fail_closed() {
         let s = state().await;
-        let (_, token, _) = create_identity_session(&s.pool, "subject").await.unwrap();
+        let (_, token, _) = crate::profiles::create_session_for_purpose(
+            &s.pool,
+            "subject",
+            crate::profiles::SessionPurpose::User,
+        )
+        .await
+        .unwrap();
         let call = |audience: &str, session_token: String| ProjectListRequest {
             audience: audience.into(),
             session_token,
@@ -714,7 +749,13 @@ mod tests {
             .status(),
             StatusCode::UNAUTHORIZED
         );
-        let (_, token, _) = create_identity_session(&s.pool, "subject").await.unwrap();
+        let (_, token, _) = crate::profiles::create_session_for_purpose(
+            &s.pool,
+            "subject",
+            crate::profiles::SessionPurpose::User,
+        )
+        .await
+        .unwrap();
         sqlx::query("UPDATE profiles SET disabled_at_unix = 1 WHERE id = 'subject'")
             .execute(&s.pool)
             .await
@@ -856,5 +897,230 @@ mod tests {
                 StatusCode::BAD_REQUEST
             );
         }
+    }
+    #[tokio::test]
+    async fn user_and_operator_sessions_cannot_cross_authorization_boundaries() {
+        use crate::profiles::{
+            create_session_for_purpose, current_profile_from_headers, root_session_profile_id,
+            SessionPurpose,
+        };
+        let s = state().await;
+        let _ = root_headers(&s).await;
+        let (_, user, _) = create_session_for_purpose(&s.pool, "actor", SessionPurpose::User)
+            .await
+            .unwrap();
+        let (_, operator, _) =
+            create_session_for_purpose(&s.pool, "actor", SessionPurpose::Operator)
+                .await
+                .unwrap();
+        let mut h = HeaderMap::new();
+        h.insert(
+            "cookie",
+            format!("vapor_identity_session={user}").parse().unwrap(),
+        );
+        assert!(current_profile_from_headers(&s.pool, &h)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(root_session_profile_id(&s.pool, &h)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            list_projects(
+                State(s.clone()),
+                service_headers("registry-token"),
+                Json(ProjectListRequest {
+                    audience: "vapor-registry".into(),
+                    session_token: operator
+                })
+            )
+            .await
+            .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            list_projects(
+                State(s.clone()),
+                service_headers("registry-token"),
+                Json(ProjectListRequest {
+                    audience: "vapor-registry".into(),
+                    session_token: user
+                })
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
+    }
+    #[tokio::test]
+    async fn steam_login_completion_issues_only_the_requested_host_only_cookie() {
+        use crate::profiles::SessionPurpose;
+        let s = state().await;
+        for (purpose, cookie, destination) in [
+            (SessionPurpose::User, "vapor_user_session=", "/dashboard"),
+            (
+                SessionPurpose::Operator,
+                "vapor_identity_session=",
+                "/admin",
+            ),
+        ] {
+            let response =
+                crate::browser_handlers::finish_steam_login(&s, "subject", purpose).await;
+            assert_eq!(response.status(), StatusCode::SEE_OTHER);
+            assert_eq!(response.headers()["location"], destination);
+            let cookies: Vec<_> = response
+                .headers()
+                .get_all("set-cookie")
+                .iter()
+                .map(|v| v.to_str().unwrap())
+                .collect();
+            assert!(cookies.iter().any(|c| c.starts_with(cookie)));
+            assert!(cookies.iter().all(|c| !c.contains("Domain=")));
+            let other = if purpose == SessionPurpose::User {
+                "vapor_identity_session="
+            } else {
+                "vapor_user_session="
+            };
+            assert!(cookies.iter().all(|c| !c.starts_with(other)));
+        }
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM profile_roles")
+                .fetch_one(&s.pool)
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn public_operator_callbacks_and_origins_are_separate() {
+        use crate::browser_handlers::{
+            login_steam_callback, login_steam_start, operator_login_steam_start,
+        };
+        use axum::extract::Query;
+        let mut s = state().await;
+        Arc::make_mut(&mut s.config).operator_origin = Some("https://admin.vapor.example".into());
+        let public = login_steam_start(State(s.clone()), HeaderMap::new()).await;
+        let operator = operator_login_steam_start(State(s.clone()), HeaderMap::new()).await;
+        let return_to = |r: &Response| {
+            reqwest::Url::parse(r.headers()["location"].to_str().unwrap())
+                .unwrap()
+                .query_pairs()
+                .find(|(k, _)| k == "openid.return_to")
+                .unwrap()
+                .1
+                .into_owned()
+        };
+        assert!(return_to(&public).starts_with("https://vapor.example/login/steam/callback?state="));
+        assert!(return_to(&operator)
+            .starts_with("https://admin.vapor.example/operator/login/steam/callback?state="));
+        let public_cookie = public.headers()["set-cookie"].to_str().unwrap();
+        let operator_cookie = operator.headers()["set-cookie"].to_str().unwrap();
+        assert!(public_cookie.starts_with("vapor_user_steam_login_state="));
+        assert!(public_cookie.contains("Path=/login/steam/callback"));
+        assert!(operator_cookie.starts_with("vapor_identity_steam_login_state="));
+        assert!(operator_cookie.contains("Path=/operator/login/steam/callback"));
+        let state_token = operator_cookie
+            .split(';')
+            .next()
+            .unwrap()
+            .split_once('=')
+            .unwrap()
+            .1;
+        let mut h = HeaderMap::new();
+        h.insert(
+            "cookie",
+            format!("vapor_user_steam_login_state={state_token}")
+                .parse()
+                .unwrap(),
+        );
+        let params = std::collections::HashMap::from([("state".into(), state_token.into())]);
+        assert_eq!(
+            login_steam_callback(State(s.clone()), h, Query(params))
+                .await
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let public_state = public_cookie
+            .split(';')
+            .next()
+            .unwrap()
+            .split_once('=')
+            .unwrap()
+            .1;
+        let mut h = HeaderMap::new();
+        h.insert(
+            "cookie",
+            format!("vapor_user_steam_login_state={public_state}")
+                .parse()
+                .unwrap(),
+        );
+        let params = std::collections::HashMap::from([
+            ("state".into(), public_state.into()),
+            ("openid.return_to".into(), return_to(&operator)),
+        ]);
+        assert_eq!(
+            login_steam_callback(State(s.clone()), h, Query(params))
+                .await
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+    #[tokio::test]
+    async fn public_login_page_does_not_render_operator_links_for_root_profile() {
+        let s = state().await;
+        let _ = root_headers(&s).await;
+        let (_, token, _) = crate::profiles::create_session_for_purpose(
+            &s.pool,
+            "actor",
+            crate::profiles::SessionPurpose::User,
+        )
+        .await
+        .unwrap();
+        let mut h = HeaderMap::new();
+        h.insert(
+            "cookie",
+            format!("vapor_user_session={token}").parse().unwrap(),
+        );
+        let response = crate::browser_handlers::login_page(State(s), h).await;
+        assert_eq!(response.headers()["cache-control"], "private, no-store");
+        let html = String::from_utf8(
+            to_bytes(response.into_body(), 100000)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(html.contains("/dashboard"));
+        assert!(!html.contains("href=\"/admin"));
+        assert!(!html.contains("/operator/"));
+    }
+    #[tokio::test]
+    async fn public_logout_revokes_only_the_public_session() {
+        use crate::profiles::{create_session_for_purpose, SessionPurpose};
+        let s = state().await;
+        let (_, user, _) = create_session_for_purpose(&s.pool, "subject", SessionPurpose::User)
+            .await
+            .unwrap();
+        let (_, operator, _) =
+            create_session_for_purpose(&s.pool, "subject", SessionPurpose::Operator)
+                .await
+                .unwrap();
+        let mut h = HeaderMap::new();
+        h.insert(
+            "cookie",
+            format!("vapor_user_session={user}; vapor_identity_session={operator}")
+                .parse()
+                .unwrap(),
+        );
+        let response = crate::browser_handlers::logout(State(s.clone()), h).await;
+        assert_eq!(response.headers()["location"], "/login");
+        assert!(response.headers()["set-cookie"]
+            .to_str()
+            .unwrap()
+            .starts_with("vapor_user_session=;"));
+        assert_eq!(sqlx::query_scalar::<_,i64>("SELECT COUNT(*) FROM identity_sessions WHERE purpose = 'user' AND revoked_at_unix IS NOT NULL").fetch_one(&s.pool).await.unwrap(), 1);
+        assert_eq!(sqlx::query_scalar::<_,i64>("SELECT COUNT(*) FROM identity_sessions WHERE purpose = 'operator' AND revoked_at_unix IS NULL").fetch_one(&s.pool).await.unwrap(), 1);
     }
 }

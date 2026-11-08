@@ -29,6 +29,7 @@ pub(crate) struct AuthConfig {
     pub(crate) cookie_secure: bool,
     pub(crate) cookie_path: String,
     pub(crate) public_origin: Option<String>,
+    pub(crate) operator_origin: Option<String>,
 }
 
 pub(crate) fn read_auth_config() -> AuthConfig {
@@ -88,6 +89,9 @@ pub(crate) fn read_auth_config() -> AuthConfig {
                     && !value.contains('\n')
             })
             .unwrap_or_else(|| "/".to_string()),
+        operator_origin: env::var("VAPOR_IDENTITY_OPERATOR_ORIGIN")
+            .ok()
+            .filter(|value| valid_public_origin(value)),
         public_origin: env::var("VAPOR_IDENTITY_PUBLIC_ORIGIN")
             .ok()
             .filter(|value| valid_public_origin(value)),

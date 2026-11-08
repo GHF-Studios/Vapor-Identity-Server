@@ -70,13 +70,38 @@ pub(crate) fn session_token_from_headers(headers: &HeaderMap) -> Option<String> 
         })
 }
 
+pub(crate) fn user_session_token_from_headers(headers: &HeaderMap) -> Option<String> {
+    let mut found = None;
+    for header in headers.get_all(COOKIE) {
+        for part in header.to_str().ok()?.split(';') {
+            if let Some(("vapor_user_session", value)) = part.trim().split_once('=') {
+                if found.is_some() || value.is_empty() {
+                    return None;
+                }
+                found = Some(value.to_string());
+            }
+        }
+    }
+    found
+}
+
+pub(crate) fn session_cookie_for_purpose(
+    config: &AuthConfig,
+    token: &str,
+    max_age: i64,
+    purpose: crate::profiles::SessionPurpose,
+) -> String {
+    session_cookie(config, token, max_age).replacen(SESSION_COOKIE, purpose.cookie(), 1)
+}
+
 pub(crate) fn same_origin_browser_request(headers: &HeaderMap, config: &AuthConfig) -> bool {
     let Some(origin) = headers.get("origin").and_then(|value| value.to_str().ok()) else {
         return false;
     };
     config
-        .public_origin
+        .operator_origin
         .as_deref()
+        .or(config.public_origin.as_deref())
         .is_some_and(|expected| origin == expected)
 }
 
@@ -116,13 +141,29 @@ pub(crate) fn github_device_ready(config: &AuthConfig) -> bool {
 }
 
 pub(crate) fn login_html(config: &AuthConfig, current: Option<&CurrentProfile>) -> String {
+    login_html_for_purpose(config, current, false)
+}
+pub(crate) fn operator_login_html(config: &AuthConfig, current: Option<&CurrentProfile>) -> String {
+    login_html_for_purpose(config, current, true)
+}
+fn login_html_for_purpose(
+    config: &AuthConfig,
+    current: Option<&CurrentProfile>,
+    operator: bool,
+) -> String {
     let body = if let Some(profile) = current {
         let display_name = profile
             .display_name
             .as_deref()
             .filter(|name| !name.trim().is_empty())
             .unwrap_or("Steam account");
-        let (access_summary, destination, destination_label) = if profile.root_authorized {
+        let (access_summary, destination, destination_label) = if !operator {
+            (
+                "Your Vapor account is signed in.",
+                "/dashboard",
+                "Open your dashboard",
+            )
+        } else if profile.root_authorized {
             (
                 "This account can access the Platform operator dashboard.",
                 "/admin",
@@ -165,11 +206,17 @@ pub(crate) fn login_html(config: &AuthConfig, current: Option<&CurrentProfile>) 
             .to_string()
     };
 
-    format!(
+    let page = format!(
         "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><meta name=\"theme-color\" content=\"#10161d\"><title>Sign in · Vapor</title>\
          <style>:root{{color-scheme:dark;font:16px/1.55 Inter,ui-sans-serif,system-ui,sans-serif;background:#10161d;color:#eef3f7;font-synthesis:none}}*{{box-sizing:border-box}}body{{margin:0;min-height:100vh;background:radial-gradient(ellipse at 50% -24%,#294346 0,#10161d 58%)}}a{{color:#a9d8cb}}a:focus-visible{{outline:2px solid #9fe1ce;outline-offset:4px;border-radius:3px}}main{{width:min(680px,calc(100% - 36px));margin:0 auto;padding:28px 0 56px}}nav{{display:flex;align-items:center;gap:20px;padding-bottom:clamp(58px,12vh,112px)}}.brand{{margin-right:auto;color:#eef3f7;font-weight:780;letter-spacing:.04em;text-decoration:none}}nav a:not(.brand){{color:#bac7ce;text-decoration:none;font-size:.92rem}}.eyebrow{{color:#9fe1ce;font-size:.76rem;font-weight:750;letter-spacing:.16em;text-transform:uppercase}}h1{{margin:10px 0 16px;font-size:clamp(2.5rem,7vw,4rem);letter-spacing:-.06em;line-height:1}}.panel{{padding:clamp(22px,5vw,36px);border:1px solid #34434a;border-radius:12px;background:rgba(20,29,35,.94);box-shadow:0 22px 80px rgba(0,0,0,.2)}}.lead{{margin:0;color:#c3cfd4;font-size:1.1rem}}.account-note{{margin:14px 0 0;color:#aebdc3;font-size:.92rem;line-height:1.65}}.signed-in{{margin:0;color:#c3cfd4}}.actions{{display:flex;align-items:center;flex-wrap:wrap;gap:16px;margin:22px 0 0}}.primary-action{{display:inline-flex;min-height:44px;align-items:center;justify-content:center;padding:0 17px;border-radius:7px;background:#9fe1ce;color:#10201d;font-weight:760;text-decoration:none}}.primary-action:hover{{background:#b8f0df}}.secondary-action{{font-weight:650;text-decoration:none}}footer{{margin-top:24px;color:#7f9298;font-size:.82rem}}@media(max-width:520px){{nav{{padding-bottom:54px}}.actions{{align-items:flex-start;flex-direction:column;gap:14px}}}}</style></head><body><main><nav aria-label=\"Main navigation\"><a class=\"brand\" href=\"/\">VAPOR</a><a href=\"/docs/\">Documentation</a></nav><section class=\"panel\" aria-labelledby=\"login-title\"><p class=\"eyebrow\">Vapor account</p><h1 id=\"login-title\">{}</h1>{body}</section><footer>Vapor sign-in uses Steam. Your game files remain local to you.</footer></main></body></html>",
         if current.is_some() { "Your account" } else { "Sign in to Vapor" }
-    )
+    );
+    if operator {
+        page.replace("/login", "/operator/login")
+            .replace("/logout", "/operator/logout")
+    } else {
+        page
+    }
 }
 
 pub(crate) fn admin_locked_html(current: Option<&CurrentProfile>) -> String {
@@ -177,7 +224,7 @@ pub(crate) fn admin_locked_html(current: Option<&CurrentProfile>) -> String {
         format!(
             "<p>You are signed in as Steam profile <code>{}</code>, but this profile is not authorized for root/admin access.</p>\
              <dl><dt>SteamID64</dt><dd>{}</dd><dt>GitHub</dt><dd>{}</dd><dt>Roles</dt><dd>{}</dd></dl>\
-             <p><a href=\"/login\">Manage identity</a> · <a href=\"/logout\">Logout</a></p>",
+             <p><a href=\"/operator/login\">Manage identity</a> · <a href=\"/operator/logout\">Logout</a></p>",
             html_escape(profile.steam_id64.as_deref().unwrap_or("unknown")),
             html_escape(profile.steam_id64.as_deref().unwrap_or("")),
             html_escape(profile.github_login.as_deref().unwrap_or("not linked")),
@@ -185,7 +232,7 @@ pub(crate) fn admin_locked_html(current: Option<&CurrentProfile>) -> String {
         )
     } else {
         "<p>Identity administration is locked. Sign in to check whether your Steam profile has admin access.</p>\
-         <p><a href=\"/login\">Login / register</a></p>"
+         <p><a href=\"/operator/login\">Login / register</a></p>"
             .to_string()
     };
 
@@ -313,10 +360,15 @@ fn append_clear_login_state_cookie(response: &mut Response, config: &AuthConfig,
 
 fn browser_login_cookie(flow: &str) -> Option<(&'static str, &'static str)> {
     match flow {
-        "steam" => Some(("vapor_identity_steam_login_state", "/login/steam/callback")),
+        "steam" => Some((
+            "vapor_identity_steam_login_state",
+            "/operator/login/steam/callback",
+        )),
+        "user-steam" => Some(("vapor_user_steam_login_state", "/login/steam/callback")),
+        "user-github" => Some(("vapor_user_github_login_state", "/login/github/callback")),
         "github" => Some((
             "vapor_identity_github_login_state",
-            "/login/github/callback",
+            "/operator/login/github/callback",
         )),
         _ => None,
     }
@@ -405,6 +457,7 @@ mod tests {
             cookie_secure: true,
             cookie_path: "/".to_owned(),
             public_origin: Some("https://vapor.example".to_owned()),
+            operator_origin: None,
         }
     }
 
@@ -506,7 +559,7 @@ mod tests {
             .next()
             .unwrap();
         let cookie = cookie.to_str().unwrap();
-        assert!(cookie.contains("Path=/login/steam/callback"));
+        assert!(cookie.contains("Path=/operator/login/steam/callback"));
         assert!(cookie.contains("HttpOnly"));
         assert!(cookie.contains("SameSite=Lax"));
         assert!(cookie.contains("Secure"));

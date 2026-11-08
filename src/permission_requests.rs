@@ -1011,6 +1011,7 @@ mod tests {
                 cookie_secure: true,
                 cookie_path: "/".to_string(),
                 public_origin: Some("https://vapor.example".to_string()),
+                operator_origin: None,
             }),
             http: reqwest::Client::new(),
         }

@@ -178,9 +178,64 @@ pub(crate) async fn revoke_role(
     Ok(result.rows_affected() > 0)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SessionPurpose {
+    User,
+    Operator,
+}
+impl SessionPurpose {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Operator => "operator",
+        }
+    }
+    pub(crate) fn cookie(self) -> &'static str {
+        match self {
+            Self::User => "vapor_user_session",
+            Self::Operator => "vapor_identity_session",
+        }
+    }
+    pub(crate) fn flow(self, github: bool) -> &'static str {
+        match (self, github) {
+            (Self::User, false) => "user-steam",
+            (Self::User, true) => "user-github",
+            (Self::Operator, false) => "steam",
+            (Self::Operator, true) => "github",
+        }
+    }
+    pub(crate) fn login_path(self) -> &'static str {
+        match self {
+            Self::User => "/login",
+            Self::Operator => "/operator/login",
+        }
+    }
+    pub(crate) fn browser_config(
+        self,
+        config: &crate::config::AuthConfig,
+    ) -> crate::config::AuthConfig {
+        let mut result = config.clone();
+        if self == Self::Operator {
+            result.public_origin = config
+                .operator_origin
+                .clone()
+                .or_else(|| config.public_origin.clone());
+        }
+        result
+    }
+}
+
 pub(crate) async fn create_identity_session(
     pool: &SqlitePool,
     profile_id: &str,
+) -> Result<(String, String, i64), sqlx::Error> {
+    create_session_for_purpose(pool, profile_id, SessionPurpose::Operator).await
+}
+
+pub(crate) async fn create_session_for_purpose(
+    pool: &SqlitePool,
+    profile_id: &str,
+    purpose: SessionPurpose,
 ) -> Result<(String, String, i64), sqlx::Error> {
     let now = unix_now_i64();
     let session_id = new_session_id();
@@ -189,14 +244,15 @@ pub(crate) async fn create_identity_session(
     let expires_at_unix = now + DASHBOARD_SESSION_TTL_SECONDS;
     sqlx::query(
         "INSERT INTO identity_sessions
-            (token_hash, session_id, profile_id, created_at_unix, expires_at_unix)
-         VALUES (?, ?, ?, ?, ?)",
+            (token_hash, session_id, profile_id, created_at_unix, expires_at_unix, purpose)
+         VALUES (?, ?, ?, ?, ?, ?)",
     )
     .bind(&token_hash)
     .bind(&session_id)
     .bind(profile_id)
     .bind(now)
     .bind(expires_at_unix)
+    .bind(purpose.as_str())
     .execute(pool)
     .await?;
     Ok((session_id, token, expires_at_unix))
@@ -221,6 +277,21 @@ pub(crate) async fn current_profile_from_headers(
     profile_by_id(pool, &profile_id).await
 }
 
+pub(crate) async fn user_profile_from_headers(
+    pool: &SqlitePool,
+    headers: &HeaderMap,
+) -> Result<Option<CurrentProfile>, sqlx::Error> {
+    let Some(token) = crate::util::user_session_token_from_headers(headers) else {
+        return Ok(None);
+    };
+    let id: Option<String> = sqlx::query_scalar("SELECT s.profile_id FROM identity_sessions s JOIN profiles p ON p.id = s.profile_id WHERE s.token_hash = ? AND s.purpose = 'user' AND s.revoked_at_unix IS NULL AND s.expires_at_unix > ? AND p.disabled_at_unix IS NULL")
+        .bind(hash_session_token(&token)).bind(unix_now_i64()).fetch_optional(pool).await?;
+    match id {
+        Some(id) => profile_by_id(pool, &id).await,
+        None => Ok(None),
+    }
+}
+
 pub(crate) async fn session_profile_id(
     pool: &SqlitePool,
     headers: &HeaderMap,
@@ -237,6 +308,7 @@ pub(crate) async fn session_profile_id(
          WHERE s.token_hash = ?
            AND s.expires_at_unix > ?
            AND s.revoked_at_unix IS NULL
+           AND s.purpose = 'operator'
            AND p.disabled_at_unix IS NULL",
     )
     .bind(token_hash)
@@ -261,6 +333,7 @@ pub(crate) async fn profile_from_session_token(
          WHERE s.token_hash = ?
            AND s.expires_at_unix > ?
            AND s.revoked_at_unix IS NULL
+           AND s.purpose = 'operator'
            AND p.disabled_at_unix IS NULL",
     )
     .bind(token_hash)
@@ -373,6 +446,7 @@ pub(crate) async fn root_session_profile_id(
          WHERE s.token_hash = ?
            AND s.expires_at_unix > ?
            AND s.revoked_at_unix IS NULL
+           AND s.purpose = 'operator'
            AND p.disabled_at_unix IS NULL
            AND r.role = 'root'
            AND r.revoked_at_unix IS NULL

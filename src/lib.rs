@@ -192,6 +192,19 @@ pub async fn routers_from_env() -> Result<HostRouters, Box<dyn std::error::Error
         .layer(DefaultBodyLimit::max(MAX_AUTH_BODY_BYTES))
         .with_state(state.clone());
     let web = Router::new()
+        .route("/operator/login", get(operator_login_page))
+        .route("/operator/login/", get(operator_login_page))
+        .route("/operator/login/steam", get(operator_login_steam_start))
+        .route(
+            "/operator/login/steam/callback",
+            get(operator_login_steam_callback),
+        )
+        .route("/operator/login/github", get(operator_login_github_start))
+        .route(
+            "/operator/login/github/callback",
+            get(operator_login_github_callback),
+        )
+        .route("/operator/logout", get(operator_logout))
         .route("/login", get(login_page))
         .route("/login/", get(login_page))
         .route("/login/steam", get(login_steam_start))

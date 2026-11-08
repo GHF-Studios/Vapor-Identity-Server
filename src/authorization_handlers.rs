@@ -227,6 +227,7 @@ mod tests {
             cookie_secure: true,
             cookie_path: "/".to_owned(),
             public_origin: Some("https://vapor.example".to_owned()),
+            operator_origin: None,
         }
     }
 

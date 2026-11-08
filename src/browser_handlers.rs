@@ -27,25 +27,175 @@ use crate::automation_credentials::{
 use crate::config::{
     BROWSER_LOGIN_ATTEMPT_TTL_SECONDS, DASHBOARD_SESSION_TTL_SECONDS, STEAM_OPENID_ENDPOINT,
 };
-use crate::permission_requests::{
-    create_permission_request, CreatePermissionRequest,
-};
+use crate::permission_requests::{create_permission_request, CreatePermissionRequest};
 use crate::persistence::*;
+use crate::profiles::{user_profile_from_headers, SessionPurpose};
 use crate::providers::{exchange_github_web_code, verify_github_access_token, verify_steam_openid};
 use crate::types::*;
 use crate::util::{
-    admin_locked_html, browser_login_state_matches, expired_session_cookie, github_browser_ready,
-    html_escape, login_html, new_browser_login_state, percent_encode, public_origin,
-    redirect_response, redirect_with_clear_login_state, redirect_with_cookie_and_clear_login_state,
-    redirect_with_login_state_cookie, same_origin_browser_request, session_token_from_headers,
-    text_response, unix_now_i64, valid_browser_state,
+    admin_locked_html, browser_login_state_matches, github_browser_ready, html_escape, login_html,
+    new_browser_login_state, percent_encode, public_origin, redirect_response,
+    redirect_with_clear_login_state, redirect_with_login_state_cookie, same_origin_browser_request,
+    session_token_from_headers, text_response, unix_now_i64, valid_browser_state,
 };
 
-pub(crate) async fn login_page(
+pub(crate) async fn login_page(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    browser_login_page(State(state), headers, SessionPurpose::User)
+        .await
+        .into_response()
+}
+pub(crate) async fn operator_login_page(
     State(state): State<AppState>,
     headers: HeaderMap,
+) -> Response {
+    browser_login_page(State(state), headers, SessionPurpose::Operator)
+        .await
+        .into_response()
+}
+pub(crate) async fn login_steam_start(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Response {
+    browser_login_steam_start(State(state), headers, SessionPurpose::User)
+        .await
+        .into_response()
+}
+pub(crate) async fn operator_login_steam_start(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Response {
+    browser_login_steam_start(State(state), headers, SessionPurpose::Operator)
+        .await
+        .into_response()
+}
+pub(crate) async fn login_steam_callback(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    browser_login_steam_callback(State(state), headers, Query(query), SessionPurpose::User)
+        .await
+        .into_response()
+}
+pub(crate) async fn operator_login_steam_callback(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    browser_login_steam_callback(
+        State(state),
+        headers,
+        Query(query),
+        SessionPurpose::Operator,
+    )
+    .await
+    .into_response()
+}
+pub(crate) async fn login_github_start(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Response {
+    browser_login_github_start(State(state), headers, SessionPurpose::User)
+        .await
+        .into_response()
+}
+pub(crate) async fn operator_login_github_start(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Response {
+    browser_login_github_start(State(state), headers, SessionPurpose::Operator)
+        .await
+        .into_response()
+}
+pub(crate) async fn login_github_callback(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<GitHubCallbackQuery>,
+) -> Response {
+    browser_login_github_callback(State(state), headers, Query(query), SessionPurpose::User)
+        .await
+        .into_response()
+}
+pub(crate) async fn operator_login_github_callback(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<GitHubCallbackQuery>,
+) -> Response {
+    browser_login_github_callback(
+        State(state),
+        headers,
+        Query(query),
+        SessionPurpose::Operator,
+    )
+    .await
+    .into_response()
+}
+pub(crate) async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    browser_logout(State(state), headers, SessionPurpose::User)
+        .await
+        .into_response()
+}
+pub(crate) async fn operator_logout(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    browser_logout(State(state), headers, SessionPurpose::Operator)
+        .await
+        .into_response()
+}
+async fn browser_profile(
+    pool: &sqlx::SqlitePool,
+    headers: &HeaderMap,
+    purpose: SessionPurpose,
+) -> Result<Option<crate::profiles::CurrentProfile>, sqlx::Error> {
+    if purpose == SessionPurpose::User {
+        user_profile_from_headers(pool, headers).await
+    } else {
+        current_profile_from_headers(pool, headers).await
+    }
+}
+pub(crate) async fn finish_steam_login(
+    state: &AppState,
+    profile_id: &str,
+    purpose: SessionPurpose,
+) -> Response {
+    let (_, token, _) = match create_session_for_purpose(&state.pool, profile_id, purpose).await {
+        Ok(session) => session,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let config = purpose.browser_config(&state.config);
+    let destination = if purpose == SessionPurpose::User {
+        "/dashboard"
+    } else {
+        "/admin"
+    };
+    if purpose == SessionPurpose::Operator {
+        return crate::util::redirect_with_cookie_and_clear_login_state(
+            &config,
+            destination,
+            &token,
+            purpose.flow(false),
+        );
+    }
+    let mut response = redirect_with_clear_login_state(&config, destination, purpose.flow(false));
+    response.headers_mut().append(
+        SET_COOKIE,
+        crate::util::session_cookie_for_purpose(
+            &config,
+            &token,
+            DASHBOARD_SESSION_TTL_SECONDS,
+            purpose,
+        )
+        .parse()
+        .unwrap(),
+    );
+    response
+}
+async fn browser_login_page(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    purpose: SessionPurpose,
 ) -> impl IntoResponse {
-    let current = match current_profile_from_headers(&state.pool, &headers).await {
+    let config = purpose.browser_config(&state.config);
+
+    let current = match browser_profile(&state.pool, &headers, purpose).await {
         Ok(profile) => profile,
         Err(error) => {
             return (
@@ -56,19 +206,31 @@ pub(crate) async fn login_page(
         }
     };
 
-    Html(login_html(&state.config, current.as_ref())).into_response()
+    let mut response = Html(if purpose == SessionPurpose::User {
+        login_html(&config, current.as_ref())
+    } else {
+        crate::util::operator_login_html(&config, current.as_ref())
+    })
+    .into_response();
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, "private, no-store".parse().unwrap());
+    response
 }
 
-pub(crate) async fn login_steam_start(
+async fn browser_login_steam_start(
     State(state): State<AppState>,
     headers: HeaderMap,
+    purpose: SessionPurpose,
 ) -> Response {
+    let config = purpose.browser_config(&state.config);
+
     let state_token = new_browser_login_state();
     let now = unix_now_i64();
     if let Err(error) = create_browser_login_attempt(
         &state.pool,
         &state_token,
-        "steam",
+        purpose.flow(false),
         None,
         now,
         now + BROWSER_LOGIN_ATTEMPT_TTL_SECONDS,
@@ -81,8 +243,11 @@ pub(crate) async fn login_steam_start(
         );
     }
 
-    let origin = public_origin(&state.config, &headers);
-    let return_to = format!("{origin}/login/steam/callback?state={state_token}");
+    let origin = public_origin(&config, &headers);
+    let return_to = format!(
+        "{origin}{}/steam/callback?state={state_token}",
+        purpose.login_path()
+    );
     let redirect = format!(
         "{STEAM_OPENID_ENDPOINT}?openid.ns={}&openid.mode=checkid_setup&openid.claimed_id={}&openid.identity={}&openid.return_to={}&openid.realm={}",
         percent_encode("http://specs.openid.net/auth/2.0"),
@@ -92,14 +257,17 @@ pub(crate) async fn login_steam_start(
         percent_encode(&format!("{origin}/")),
     );
 
-    redirect_with_login_state_cookie(&state.config, &redirect, "steam", &state_token)
+    redirect_with_login_state_cookie(&config, &redirect, purpose.flow(false), &state_token)
 }
 
-pub(crate) async fn login_steam_callback(
+async fn browser_login_steam_callback(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(params): Query<HashMap<String, String>>,
+    purpose: SessionPurpose,
 ) -> Response {
+    let config = purpose.browser_config(&state.config);
+
     let Some(state_token) = params
         .get("state")
         .filter(|value| valid_browser_state(value))
@@ -109,13 +277,13 @@ pub(crate) async fn login_steam_callback(
             "identity: missing or invalid state",
         );
     };
-    if !browser_login_state_matches(&headers, "steam", state_token) {
+    if !browser_login_state_matches(&headers, purpose.flow(false), state_token) {
         return text_response(
             StatusCode::UNAUTHORIZED,
             "identity: Steam login state does not match this browser",
         );
     }
-    match browser_login_attempt(&state.pool, state_token, "steam").await {
+    match browser_login_attempt(&state.pool, state_token, purpose.flow(false)).await {
         Ok(Some(_attempt)) => {}
         Ok(None) => {
             return text_response(
@@ -131,8 +299,11 @@ pub(crate) async fn login_steam_callback(
         }
     }
 
-    let origin = public_origin(&state.config, &headers);
-    let expected_return_to = format!("{origin}/login/steam/callback?state={state_token}");
+    let origin = public_origin(&config, &headers);
+    let expected_return_to = format!(
+        "{origin}{}/steam/callback?state={state_token}",
+        purpose.login_path()
+    );
     if params
         .get("openid.return_to")
         .is_none_or(|return_to| return_to != &expected_return_to)
@@ -147,7 +318,7 @@ pub(crate) async fn login_steam_callback(
         Ok(steam_id64) => steam_id64,
         Err(response) => return response,
     };
-    match claim_browser_login_attempt(&state.pool, state_token, "steam").await {
+    match claim_browser_login_attempt(&state.pool, state_token, purpose.flow(false)).await {
         Ok(true) => {}
         Ok(false) => {
             return text_response(
@@ -171,30 +342,23 @@ pub(crate) async fn login_steam_callback(
             );
         }
     };
-    let (_session_id, token, _expires_at_unix) =
-        match create_identity_session(&state.pool, &profile_id).await {
-            Ok(session) => session,
-            Err(error) => {
-                return text_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    &format!("identity: failed to create login session: {error}"),
-                );
-            }
-        };
-    redirect_with_cookie_and_clear_login_state(&state.config, "/admin", &token, "steam")
+    finish_steam_login(&state, &profile_id, purpose).await
 }
 
-pub(crate) async fn login_github_start(
+async fn browser_login_github_start(
     State(state): State<AppState>,
     headers: HeaderMap,
+    purpose: SessionPurpose,
 ) -> Response {
-    if !github_browser_ready(&state.config) {
+    let config = purpose.browser_config(&state.config);
+
+    if !github_browser_ready(&config) {
         return text_response(
             StatusCode::SERVICE_UNAVAILABLE,
             "identity: GitHub browser login is not configured",
         );
     }
-    let Some(profile) = (match current_profile_from_headers(&state.pool, &headers).await {
+    let Some(profile) = (match browser_profile(&state.pool, &headers, purpose).await {
         Ok(profile) => profile,
         Err(error) => {
             return text_response(
@@ -214,7 +378,7 @@ pub(crate) async fn login_github_start(
     if let Err(error) = create_browser_login_attempt(
         &state.pool,
         &state_token,
-        "github",
+        purpose.flow(true),
         Some(&profile.profile_id),
         now,
         now + BROWSER_LOGIN_ATTEMPT_TTL_SECONDS,
@@ -227,8 +391,8 @@ pub(crate) async fn login_github_start(
         );
     }
 
-    let origin = public_origin(&state.config, &headers);
-    let redirect_uri = format!("{origin}/login/github/callback");
+    let origin = public_origin(&config, &headers);
+    let redirect_uri = format!("{origin}{}/github/callback", purpose.login_path());
     let client_id = state.config.github_client_id.as_deref().unwrap_or_default();
     let redirect = format!(
         "https://github.com/login/oauth/authorize?client_id={}&redirect_uri={}&scope={}&state={}&allow_signup=true",
@@ -237,14 +401,17 @@ pub(crate) async fn login_github_start(
         percent_encode("read:user"),
         percent_encode(&state_token),
     );
-    redirect_with_login_state_cookie(&state.config, &redirect, "github", &state_token)
+    redirect_with_login_state_cookie(&config, &redirect, purpose.flow(true), &state_token)
 }
 
-pub(crate) async fn login_github_callback(
+async fn browser_login_github_callback(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<GitHubCallbackQuery>,
+    purpose: SessionPurpose,
 ) -> Response {
+    let config = purpose.browser_config(&state.config);
+
     if query.error.is_some() {
         return text_response(
             StatusCode::UNAUTHORIZED,
@@ -268,7 +435,7 @@ pub(crate) async fn login_github_callback(
             "identity: missing or invalid state",
         );
     };
-    if !browser_login_state_matches(&headers, "github", state_token) {
+    if !browser_login_state_matches(&headers, purpose.flow(true), state_token) {
         return text_response(
             StatusCode::UNAUTHORIZED,
             "identity: GitHub login state does not match this browser",
@@ -287,7 +454,7 @@ pub(crate) async fn login_github_callback(
         );
     };
 
-    let attempt = match browser_login_attempt(&state.pool, state_token, "github").await {
+    let attempt = match browser_login_attempt(&state.pool, state_token, purpose.flow(true)).await {
         Ok(Some(attempt)) => attempt,
         Ok(None) => {
             return text_response(
@@ -308,7 +475,7 @@ pub(crate) async fn login_github_callback(
             "identity: GitHub browser login must attach to a Steam profile",
         );
     };
-    if current_profile_from_headers(&state.pool, &headers)
+    if browser_profile(&state.pool, &headers, purpose)
         .await
         .ok()
         .flatten()
@@ -320,8 +487,8 @@ pub(crate) async fn login_github_callback(
         );
     }
 
-    let origin = public_origin(&state.config, &headers);
-    let redirect_uri = format!("{origin}/login/github/callback");
+    let origin = public_origin(&config, &headers);
+    let redirect_uri = format!("{origin}{}/github/callback", purpose.login_path());
     let token =
         match exchange_github_web_code(&state.http, client_id, client_secret, code, &redirect_uri)
             .await
@@ -334,7 +501,7 @@ pub(crate) async fn login_github_callback(
         Err(response) => return response,
     };
     let display_name = user.name.as_deref().unwrap_or(&user.login);
-    match claim_browser_login_attempt(&state.pool, state_token, "github").await {
+    match claim_browser_login_attempt(&state.pool, state_token, purpose.flow(true)).await {
         Ok(true) => {}
         Ok(false) => {
             return text_response(
@@ -357,11 +524,21 @@ pub(crate) async fn login_github_callback(
             &format!("identity: failed to link GitHub identity: {error}"),
         );
     }
-    redirect_with_clear_login_state(&state.config, "/login", "github")
+    redirect_with_clear_login_state(&config, purpose.login_path(), purpose.flow(true))
 }
 
-pub(crate) async fn logout(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
-    if let Some(token) = session_token_from_headers(&headers) {
+async fn browser_logout(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    purpose: SessionPurpose,
+) -> impl IntoResponse {
+    let config = purpose.browser_config(&state.config);
+
+    if let Some(token) = if purpose == SessionPurpose::User {
+        crate::util::user_session_token_from_headers(&headers)
+    } else {
+        session_token_from_headers(&headers)
+    } {
         if let Err(error) = revoke_identity_session(&state.pool, &token).await {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -373,8 +550,15 @@ pub(crate) async fn logout(State(state): State<AppState>, headers: HeaderMap) ->
     (
         StatusCode::SEE_OTHER,
         [
-            (SET_COOKIE, expired_session_cookie(&state.config)),
-            (LOCATION, "/login".to_string()),
+            (
+                SET_COOKIE,
+                if purpose == SessionPurpose::Operator {
+                    crate::util::expired_session_cookie(&config)
+                } else {
+                    crate::util::session_cookie_for_purpose(&config, "", 0, purpose)
+                },
+            ),
+            (LOCATION, purpose.login_path().to_string()),
         ],
         "",
     )
@@ -587,7 +771,7 @@ pub(crate) async fn admin_dashboard(
     admin_fragment_response(format!(
         "<p class=\"eyebrow\">Identity</p><h1>Accounts and access</h1>\
          <p>Signed in as Steam profile <code>{}</code>. Root role is active.</p>\
-         <p><a href=\"/login\">Identity</a> · <a href=\"/logout\">Logout</a></p>\
+         <p><a href=\"/operator/login\">Identity</a> · <a href=\"/operator/logout\">Logout</a></p>\
          {notice}{error}\
          <h2>Readiness</h2>\
          <ul><li>Steam browser login: <code>true</code></li>\
