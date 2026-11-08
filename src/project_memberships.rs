@@ -55,12 +55,23 @@ fn role_rank(role: &str) -> Option<u8> {
         _ => None,
     }
 }
-fn valid_id(id: &str) -> bool {
+fn valid_profile_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 128
         && id
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+}
+
+fn valid_project_id(id: &str) -> bool {
+    let component = |value: &str| {
+        (1..=63).contains(&value.len())
+            && value
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'_' | b'-'))
+    };
+    id.split_once('/')
+        .is_some_and(|(namespace, slug)| component(namespace) && component(slug))
 }
 
 async fn session(
@@ -76,7 +87,7 @@ async fn session(
         headers,
         state.config.authorization_service_token.as_deref(),
     ) {
-        return Err(StatusCode::UNAUTHORIZED);
+        return Err(StatusCode::FORBIDDEN);
     }
     if !(32..=256).contains(&token.len()) {
         return Err(StatusCode::BAD_REQUEST);
@@ -132,7 +143,7 @@ async fn check(
     let (profile_id, expires_at_unix) =
         session(state, headers, &request.audience, &request.session_token).await?;
     let minimum = role_rank(&request.minimum_role)
-        .filter(|_| valid_id(&request.project_id))
+        .filter(|_| valid_project_id(&request.project_id))
         .ok_or(StatusCode::BAD_REQUEST)?;
     let role: Option<String> = sqlx::query_scalar("SELECT role FROM project_memberships WHERE project_id = ? AND profile_id = ? AND revoked_at_unix IS NULL").bind(&request.project_id).bind(profile_id).fetch_optional(&state.pool).await.map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
     let allowed = role
@@ -197,8 +208,8 @@ async fn apply(
 ) -> Result<(i64, bool), StatusCode> {
     let actor = root_actor(state, headers, true).await?;
     if !change.confirmed
-        || !valid_id(&change.project_id)
-        || !valid_id(&change.profile_id)
+        || !valid_project_id(&change.project_id)
+        || !valid_profile_id(&change.profile_id)
         || role_rank(&change.role).is_none()
         || change.expected_version < 0
     {
@@ -220,9 +231,10 @@ async fn mutate(
         .await
         .map_err(db_error)?;
     let exists: i64 = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM profiles WHERE id = ? AND disabled_at_unix IS NULL)",
+        "SELECT EXISTS(SELECT 1 FROM profiles WHERE id = ? AND (? OR disabled_at_unix IS NULL))",
     )
     .bind(&change.profile_id)
+    .bind(revoke)
     .fetch_one(&mut *tx)
     .await
     .map_err(db_error)?;
@@ -295,7 +307,7 @@ pub(crate) async fn membership_fragment(
         return private(status.into_response());
     }
     let rows = match sqlx::query("SELECT project_id, profile_id, role, version, revoked_at_unix FROM project_memberships ORDER BY project_id, profile_id").fetch_all(&state.pool).await { Ok(rows) => rows, Err(_) => return private(StatusCode::SERVICE_UNAVAILABLE.into_response()) };
-    let mut body = String::from("<h1>Project memberships</h1><p>Project IDs come from Registry. Global roles do not grant Project access. Use version 0 for a new membership; otherwise use the version below.</p><form method=\"post\" action=\"/admin/identity/project-memberships/grant\"><label>Project ID <input name=\"project_id\" maxlength=\"128\" pattern=\"[a-zA-Z0-9_-]+\" required></label><label>Profile ID <input name=\"profile_id\" maxlength=\"128\" required></label><label>Role <select name=\"role\"><option>viewer</option><option>developer</option><option>owner</option></select></label><label>Expected version <input type=\"number\" name=\"expected_version\" min=\"0\" value=\"0\" required></label><label><input type=\"checkbox\" name=\"confirmed\" value=\"true\" required> Confirm grant</label><button>Grant membership</button></form><table><thead><tr><th>Project</th><th>Profile</th><th>Role</th><th>Version</th><th>Status</th><th>Action</th></tr></thead><tbody>");
+    let mut body = String::from("<h1>Project memberships</h1><p>Project IDs come from Registry. Global roles do not grant Project access. Use version 0 for a new membership; otherwise use the version below.</p><form method=\"post\" action=\"/admin/identity/project-memberships/grant\"><label>Project ID <input name=\"project_id\" maxlength=\"127\" pattern=\"[a-z0-9_-]{1,63}/[a-z0-9_-]{1,63}\" required></label><label>Profile ID <input name=\"profile_id\" maxlength=\"128\" required></label><label>Role <select name=\"role\"><option>viewer</option><option>developer</option><option>owner</option></select></label><label>Expected version <input type=\"number\" name=\"expected_version\" min=\"0\" value=\"0\" required></label><label><input type=\"checkbox\" name=\"confirmed\" value=\"true\" required> Confirm grant</label><button>Grant membership</button></form><table><thead><tr><th>Project</th><th>Profile</th><th>Role</th><th>Version</th><th>Status</th><th>Action</th></tr></thead><tbody>");
     for row in rows {
         let project = html_escape(&row.get::<String, _>("project_id"));
         let profile = html_escape(&row.get::<String, _>("profile_id"));
@@ -364,7 +376,7 @@ mod tests {
     }
     fn change(role: &str, version: i64) -> MembershipChange {
         MembershipChange {
-            project_id: "project-1".into(),
+            project_id: "ghf-studios/loo-cast".into(),
             profile_id: "subject".into(),
             role: role.into(),
             expected_version: version,
@@ -441,7 +453,9 @@ mod tests {
         for row in rows {
             assert_eq!(row.get::<String, _>("actor_profile_id"), "actor");
             assert_eq!(row.get::<String, _>("subject_profile_id"), "subject");
-            assert!(row.get::<String, _>("detail").contains("project-1"));
+            assert!(row
+                .get::<String, _>("detail")
+                .contains("ghf-studios/loo-cast"));
         }
     }
     #[tokio::test]
@@ -461,7 +475,7 @@ mod tests {
             )
             .await
             .status(),
-            StatusCode::UNAUTHORIZED
+            StatusCode::FORBIDDEN
         );
         let data = json(
             list_projects(
@@ -497,9 +511,9 @@ mod tests {
             .unwrap();
         let (_, token, _) = create_identity_session(&s.pool, "subject").await.unwrap();
         for (project, minimum, expected) in [
-            ("project-1", "viewer", true),
-            ("project-1", "owner", false),
-            ("project-2", "viewer", false),
+            ("ghf-studios/loo-cast", "viewer", true),
+            ("ghf-studios/loo-cast", "owner", false),
+            ("ghf-studios/mad-max-modding", "viewer", false),
         ] {
             let result = json(
                 check_project(
@@ -604,7 +618,7 @@ mod tests {
         );
         let html =
             String::from_utf8(to_bytes(html.into_body(), 100000).await.unwrap().to_vec()).unwrap();
-        assert!(html.contains("project-1"));
+        assert!(html.contains("ghf-studios/loo-cast"));
         assert!(html.contains("expected_version"));
     }
     #[tokio::test]
@@ -617,7 +631,7 @@ mod tests {
             .await
             .unwrap();
         let mut active = change("owner", 0);
-        active.project_id = "project-2".into();
+        active.project_id = "ghf-studios/mad-max-modding".into();
         mutate(&s.pool, "actor", &active, false).await.unwrap();
         let path = std::env::temp_dir().join(format!(
             "identity-project-test-{}.sqlite3",
@@ -791,5 +805,56 @@ mod tests {
                 .unwrap(),
             0
         );
+    }
+    #[tokio::test]
+    async fn disabled_profiles_can_be_revoked_but_not_granted() {
+        let s = state().await;
+        let h = root_headers(&s).await;
+        assert_eq!(
+            grant_membership(State(s.clone()), h.clone(), Json(change("viewer", 0)))
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        sqlx::query("UPDATE profiles SET disabled_at_unix = 1 WHERE id = 'subject'")
+            .execute(&s.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            revoke_membership(State(s.clone()), h.clone(), Json(change("viewer", 1)))
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            grant_membership(State(s.clone()), h, Json(change("viewer", 2)))
+                .await
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+    }
+    #[tokio::test]
+    async fn actual_project_ids_are_accepted_with_bounded_single_separator() {
+        let s = state().await;
+        let h = root_headers(&s).await;
+        let response =
+            grant_membership(State(s.clone()), h.clone(), Json(change("viewer", 0))).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        for id in [
+            "ghf-studios//loo-cast",
+            "/loo-cast",
+            "ghf-studios/",
+            "ghf-studios/loo-cast/more",
+            "ghf-studios/<script>",
+        ] {
+            let mut c = change("viewer", 0);
+            c.project_id = id.into();
+            assert_eq!(
+                grant_membership(State(s.clone()), h.clone(), Json(c))
+                    .await
+                    .status(),
+                StatusCode::BAD_REQUEST
+            );
+        }
     }
 }

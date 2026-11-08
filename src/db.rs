@@ -360,7 +360,7 @@ pub(crate) async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error>
     .execute(&mut *tx)
     .await?;
     sqlx::query("CREATE TABLE IF NOT EXISTS project_memberships (
-        project_id TEXT NOT NULL CHECK(length(project_id) BETWEEN 1 AND 128 AND project_id NOT GLOB '*[^a-zA-Z0-9_-]*'),
+        project_id TEXT NOT NULL CHECK(length(project_id) BETWEEN 3 AND 127 AND project_id NOT GLOB '*[^a-z0-9_/-]*' AND instr(project_id, '/') BETWEEN 2 AND 64 AND length(substr(project_id, instr(project_id, '/') + 1)) BETWEEN 1 AND 63 AND instr(substr(project_id, instr(project_id, '/') + 1), '/') = 0),
         profile_id TEXT NOT NULL REFERENCES profiles(id) ON DELETE RESTRICT,
         role TEXT NOT NULL CHECK(role IN ('owner', 'developer', 'viewer')),
         version INTEGER NOT NULL CHECK(version > 0),
@@ -515,7 +515,7 @@ mod project_migration_tests {
         .execute(&pool)
         .await
         .unwrap();
-        sqlx::query("INSERT INTO project_memberships(project_id, profile_id, role, version, granted_by_profile_id, granted_at_unix) VALUES ('project-1', 'subject', 'viewer', 1, 'actor', 1)").execute(&pool).await.expect("membership table exists");
+        sqlx::query("INSERT INTO project_memberships(project_id, profile_id, role, version, granted_by_profile_id, granted_at_unix) VALUES ('ghf-studios/loo-cast', 'subject', 'viewer', 1, 'actor', 1)").execute(&pool).await.expect("membership table exists");
         assert!(sqlx::query("UPDATE project_memberships SET role = 'root'")
             .execute(&pool)
             .await

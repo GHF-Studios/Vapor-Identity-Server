@@ -296,7 +296,7 @@ src/util.rs               small shared helpers and HTML shell rendering
 
 Identity owns Project grants, independently of global roles. No global role
 (including root) grants Project access. Registry owns the Project metadata;
-Identity accepts only its opaque stable ID (1–128 ASCII letters/digits, `_`, `-`).
+Identity accepts only its opaque stable ID (lowercase `namespace/slug`, each 1–63 ASCII letters/digits, `_`, `-`).
 Project roles are `viewer < developer < owner`.
 
 - `POST /v1/internal/projects/list`: `{ "audience": "vapor-registry", "session_token": "..." }`
@@ -307,8 +307,7 @@ Project roles are `viewer < developer < owner`.
   live, unrevoked session for an enabled profile. Registry forwards its caller's
   `vapor_user_session` token in the JSON body. The public user-session login flow
   is a separate prerequisite; these endpoints do not create or change cookies.
-- Invalid body/audience is 400, invalid service credential or inactive session
-  is 401, unavailable storage is 503. Responses are `private, no-store`.
+- Invalid body/audience is 400, invalid service credential is 403, inactive session is 401, unavailable storage is 503. Responses are `private, no-store`.
   Expiry is bounded by the session expiry and 30 seconds; callers must recheck
   every private Project data request.
 - Root session operators use `POST /v1/admin/project-memberships/grant` or
