@@ -181,7 +181,7 @@ pub(crate) async fn login_steam_callback(
                 );
             }
         };
-    redirect_with_cookie_and_clear_login_state(&state.config, "/login", &token, "steam")
+    redirect_with_cookie_and_clear_login_state(&state.config, "/admin", &token, "steam")
 }
 
 pub(crate) async fn login_github_start(
